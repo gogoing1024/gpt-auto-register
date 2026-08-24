@@ -936,6 +936,65 @@ def list_runs(limit: int = 50) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def _unlink_run_logs(paths: list[str]) -> None:
+    """只删 webui/logs 下的 run 日志，路径不对的一律跳过。"""
+    log_root = (Path(__file__).resolve().parent / "logs").resolve()
+    for raw in paths:
+        if not raw:
+            continue
+        try:
+            path = Path(raw).resolve()
+        except Exception:
+            continue
+        if path.parent != log_root:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def delete_runs(run_ids: list[str]) -> int:
+    """按 run_id 删除记录和对应日志文件。跳过还在 running 的。"""
+    ids = [str(x).strip() for x in (run_ids or []) if str(x).strip()]
+    if not ids:
+        return 0
+    with _lock:
+        con = _conn()
+        ph = ",".join("?" * len(ids))
+        cur = con.execute(
+            f"SELECT run_id, log_path, status FROM runs WHERE run_id IN ({ph})",
+            ids,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        doomed = [r for r in rows if (r.get("status") or "") != "running"]
+        if not doomed:
+            return 0
+        doomed_ids = [r["run_id"] for r in doomed]
+        ph2 = ",".join("?" * len(doomed_ids))
+        con.execute(f"DELETE FROM runs WHERE run_id IN ({ph2})", doomed_ids)
+        con.commit()
+    _unlink_run_logs([r.get("log_path") or "" for r in doomed])
+    return len(doomed)
+
+
+def delete_all_runs() -> int:
+    """清空已结束的运行记录（running 留下）。"""
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            "SELECT log_path FROM runs WHERE status IS NULL OR status != 'running'"
+        )
+        paths = [r["log_path"] for r in cur.fetchall()]
+        rc = con.execute(
+            "DELETE FROM runs WHERE status IS NULL OR status != 'running'"
+        )
+        con.commit()
+        n = rc.rowcount
+    _unlink_run_logs(paths)
+    return n
+
+
 # ──────────────────────── settings (KV) ────────────────────────
 
 

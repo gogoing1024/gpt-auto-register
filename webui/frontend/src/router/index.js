@@ -81,7 +81,7 @@ const router = createRouter({
 // 路由切换顶部进度条
 router.beforeEach((to, from, next) => {
   NProgress.start()
-  if (to.meta?.title) document.title = `${to.meta.title} · Outlook Register`
+  if (to.meta?.title) document.title = `${to.meta.title} · ChatGPT Register`
   next()
 })
 router.afterEach(() => {

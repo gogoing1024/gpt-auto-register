@@ -54,7 +54,7 @@ logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+app = FastAPI(title="ChatGPT Register", docs_url=None, redoc_url=None)
 
 
 # ──────────────────────── Pydantic 模型 ────────────────────────
@@ -353,6 +353,30 @@ def _safe_get(q):
 @app.get("/api/runs")
 def api_runs(limit: int = 50):
     return {"ok": True, "items": db.list_runs(limit=limit)}
+
+
+@app.delete("/api/runs/{run_id}")
+def api_delete_run(run_id: str):
+    n = db.delete_runs([run_id])
+    if not n:
+        raise HTTPException(404, "记录不存在或仍在运行")
+    return {"ok": True, "deleted": n}
+
+
+class BulkDeleteRunsReq(BaseModel):
+    run_ids: Optional[list[str]] = Field(None, description="要删除的 run_id 列表")
+    all: bool = Field(False, description="true = 清空已结束的运行记录")
+
+
+@app.post("/api/runs/bulk_delete")
+def api_bulk_delete_runs(req: BulkDeleteRunsReq):
+    if req.all:
+        n = db.delete_all_runs()
+        return {"ok": True, "deleted": n}
+    if req.run_ids:
+        n = db.delete_runs(req.run_ids)
+        return {"ok": True, "deleted": n}
+    raise HTTPException(400, "需要 run_ids 或 all=true")
 
 
 @app.get("/api/registered")

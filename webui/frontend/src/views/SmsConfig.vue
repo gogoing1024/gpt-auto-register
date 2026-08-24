@@ -117,14 +117,8 @@ onActivated(() => load())
 
         <el-form-item label="接码平台">
           <el-radio-group v-model="provider" @change="onProviderChange">
-            <el-radio value="smsbower">
-              <span>SmsBower（立即取消就退款）</span>
-              <a :href="'https://smsbower.app/cn?ref=499410'" target="_blank" class="sms-reg-link" @click.stop>前往注册 ↗</a>
-            </el-radio>
-            <el-radio value="herosms">
-              <span>HeroSMS（取消后 20 分钟自动退款）</span>
-              <a :href="'https://hero-sms.com/?ref=738021'" target="_blank" class="sms-reg-link" @click.stop>前往注册 ↗</a>
-            </el-radio>
+            <el-radio value="smsbower">SmsBower（立即取消就退款）</el-radio>
+            <el-radio value="herosms">HeroSMS（取消后 20 分钟自动退款）</el-radio>
           </el-radio-group>
         </el-form-item>
 
@@ -212,8 +206,3 @@ onActivated(() => load())
     </FooterToolbar>
   </div>
 </template>
-
-<style scoped>
-.sms-reg-link { margin-left: 6px; color: var(--el-color-primary); text-decoration: none; font-size: 12px; white-space: nowrap; vertical-align: middle; }
-.sms-reg-link:hover { text-decoration: underline; }
-</style>

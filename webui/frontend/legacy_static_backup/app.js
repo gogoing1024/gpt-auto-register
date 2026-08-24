@@ -1,4 +1,4 @@
-// 团子喵的 WebUI 交互逻辑 ~
+// ChatGPT Register WebUI 交互逻辑
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);

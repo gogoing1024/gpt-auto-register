@@ -526,18 +526,72 @@ class AuthFlow:
         msg = str(exc).lower()
         return "registration_disallowed" in msg
 
-    def _get_cookie_value_by_name(self, name: str) -> str:
-        """按 cookie 名称获取值（忽略 domain 冲突）。"""
+    def _get_cookie_value_by_name(self, name: str, domain: str = "") -> str:
+        """按 cookie 名称取值。同名多域时不抛 CookieConflict。
+
+        curl_cffi 的 cookies.get(name) 在 .chatgpt.com / .openai.com 各有一份
+        oai-did 时会直接炸。这里先按指定域（或 oai-did 默认 chatgpt.com）取，
+        再扫 jar，绝不把 CookieConflict 抛出去。
+        """
+        target = (name or "").strip()
+        if not target:
+            return ""
+        cookies = getattr(self.session, "cookies", None)
+        if cookies is None:
+            return ""
+
+        prefer: list[str] = []
+        if domain:
+            prefer = [domain, domain.lstrip("."), f".{domain.lstrip('.')}"]
+        elif target.lower() == "oai-did":
+            prefer = [".chatgpt.com", "chatgpt.com"]
+
+        for d in prefer:
+            try:
+                v = cookies.get(target, default="", domain=d)
+                if v:
+                    return str(v).strip()
+            except TypeError:
+                try:
+                    v = cookies.get(target, "", domain=d)
+                    if v:
+                        return str(v).strip()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         try:
-            jar = getattr(self.session.cookies, "jar", None)
-            if jar is None:
-                return ""
-            target = (name or "").strip().lower()
-            for c in jar:
-                if (getattr(c, "name", "") or "").strip().lower() == target:
-                    return (getattr(c, "value", "") or "").strip()
+            v = cookies.get(target, "")
+            if v:
+                return str(v).strip()
         except Exception:
             pass
+
+        found: list[tuple[str, str]] = []
+        try:
+            jar = getattr(cookies, "jar", None)
+            iterable = jar if jar is not None else cookies
+            for c in iterable:
+                cname = getattr(c, "name", None)
+                if cname is None:
+                    continue
+                if str(cname).strip().lower() != target.lower():
+                    continue
+                val = (getattr(c, "value", "") or "").strip()
+                if not val:
+                    continue
+                found.append(((getattr(c, "domain", "") or "").strip().lower(), val))
+        except Exception:
+            pass
+
+        if prefer:
+            needles = {d.lower().lstrip(".") for d in prefer}
+            for cdom, val in found:
+                if cdom.lstrip(".") in needles or any(n in cdom for n in needles):
+                    return val
+        if found:
+            return found[0][1]
         return ""
 
     def _extract_login_challenge_from_cookie(self) -> str:
@@ -849,7 +903,7 @@ class AuthFlow:
             # 猜的密码只拿去碰一下 401，不落进 result（否则会被当成真密码存库/打日志）
             logger.info("Codex 登录推进：该号无已知密码，用默认规则猜一个试试（多半 401）")
 
-        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        device_id = (self.result.device_id or "").strip() or self._get_cookie_value_by_name("oai-did")
         if not device_id:
             device_id = str(uuid.uuid4())
             self.result.device_id = device_id
@@ -944,7 +998,7 @@ class AuthFlow:
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json"
         headers["Origin"] = "https://auth.openai.com"
-        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        device_id = (self.result.device_id or "").strip() or self._get_cookie_value_by_name("oai-did")
         if device_id:
             headers["oai-device-id"] = device_id
         return headers
@@ -1634,7 +1688,7 @@ class AuthFlow:
         except Exception:
             host = ""
         if "auth.openai.com" in host:
-            device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+            device_id = (self.result.device_id or "").strip() or self._get_cookie_value_by_name("oai-did")
             if device_id:
                 headers["oai-device-id"] = device_id
 
@@ -1752,7 +1806,7 @@ class AuthFlow:
                 cookies = self.session.cookies.get_dict()
             except Exception:
                 cookies = {}
-            if "oai-did" in cookies:
+            if "oai-did" in cookies or self._get_cookie_value_by_name("oai-did"):
                 logger.info(
                     f"chatgpt.com warmup 完成（第 {attempt + 1} 次，oai-did 已种，"
                     f"共 {len(cookies)} 个 cookie）"
@@ -1913,23 +1967,8 @@ class AuthFlow:
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
 
-        # 从 cookie 获取 oai-did
-        device_id = ""
-        for cookie in self.session.cookies:
-            if hasattr(cookie, "name"):
-                if cookie.name == "oai-did":
-                    device_id = cookie.value
-                    break
-            elif isinstance(cookie, str) and cookie == "oai-did":
-                device_id = self.session.cookies.get("oai-did", "")
-                break
-
-        # curl_cffi cookies 访问方式
-        if not device_id:
-            try:
-                device_id = self.session.cookies.get("oai-did", "")
-            except Exception:
-                pass
+        # oai-did 在 .chatgpt.com / .openai.com 会各有一份，不能 cookies.get("oai-did")
+        device_id = self._get_cookie_value_by_name("oai-did")
 
         # fallback: 从 HTML 提取
         if not device_id:

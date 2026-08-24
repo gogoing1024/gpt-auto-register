@@ -5,6 +5,9 @@ export const startRegister = (payload) => http.post('/api/register', payload)
 
 // ──────────────── 运行记录 ────────────────
 export const listRuns = (limit = 50) => http.get('/api/runs', { params: { limit } })
+export const deleteRun = (runId) => http.delete(`/api/runs/${encodeURIComponent(runId)}`)
+export const bulkDeleteRuns = (payload) =>
+  http.post('/api/runs/bulk_delete', payload) // { run_ids } 或 { all: true }
 
 // ──────────────── 注册结果 registered ────────────────
 export const listRegistered = (params) =>
