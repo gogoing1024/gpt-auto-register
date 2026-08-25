@@ -258,11 +258,32 @@ async function downloadAndDelete() {
 const credVisible = ref(false)
 const credEmail = ref('')
 const credData = ref(null)
-// totp_secret 放最前：它是唯一「服务端取不回」的字段，弹窗一打开就要能看到
-const CRED_KEYS = ['totp_secret', 'totp_factor_id', 'access_token', 'session_token', 'refresh_token', 'id_token', 'device_id', 'csrf_token', 'cookie_header', 'password']
+// 展示顺序 + 中文别名。密码和 2FA 密钥排最前：登录要用的就这两个，
+// 后面那堆 token 是喂给 API 的，日常打开弹窗多半只是来抄前两行。
+// 末尾几个（factor_id / device_id / csrf / cookie）基本只在排查问题时才看。
+const CRED_META = [
+  ['password', '登录密码'],
+  ['totp_secret', '2FA 密钥'],
+  ['access_token', '访问令牌'],
+  ['session_token', '会话令牌'],
+  ['refresh_token', '刷新令牌'],
+  ['id_token', 'ID 令牌'],
+  ['totp_factor_id', '2FA factor'],
+  ['device_id', '设备 ID'],
+  ['csrf_token', 'CSRF'],
+  ['cookie_header', 'Cookie'],
+]
+// 超过这个长度才用多行框。32 位 secret、36 位 uuid、16 位密码都能在单行里
+// 一眼看全，之前一律给 2 行 textarea，短字段白占一倍高度、长 token 又只露两行。
+const INLINE_MAX = 80
 const credRows = computed(() => {
   if (!credData.value) return []
-  return CRED_KEYS.filter((k) => credData.value[k]).map((k) => ({ key: k, val: credData.value[k] }))
+  return CRED_META
+    .filter(([k]) => credData.value[k])
+    .map(([k, label]) => {
+      const val = String(credData.value[k])
+      return { key: k, label, val, short: val.length <= INLINE_MAX, critical: k === 'totp_secret' }
+    })
 })
 async function viewCred(email) {
   try {
@@ -523,22 +544,32 @@ onActivated(() => load())
         </template>
       </el-dialog>
 
-      <el-dialog v-model="credVisible" :title="credEmail" width="760px" top="6vh">
+      <el-dialog v-model="credVisible" width="720px" top="6vh">
         <template #header>
-          <div style="display: flex; align-items: center; gap: 12px">
-            <span class="mono" style="font-weight: 600">{{ credEmail }}</span>
-            <el-button size="small" @click="copyAllJson">复制全部 JSON</el-button>
+          <div class="cred-head">
+            <span class="mono cred-email">{{ credEmail }}</span>
+            <el-button size="small" @click="copyAllJson">
+              <el-icon><CopyDocument /></el-icon>复制全部 JSON
+            </el-button>
           </div>
         </template>
-        <div v-for="r in credRows" :key="r.key" style="margin-bottom: 12px">
-          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 4px">
-            <span class="mono" style="font-weight: 600; color: var(--dango-pink-dark)">{{ r.key }}</span>
-            <el-tag size="small" type="info">len={{ r.val.length }}</el-tag>
-            <el-button size="small" @click="copyText(r.val)">复制</el-button>
+        <!-- 限高 + 内部滚动：字段多的号（7 个以上）弹窗会顶出视口，
+             底部的字段直接被裁掉，而 el-dialog 默认不给 body 滚动条。 -->
+        <div class="cred-body">
+          <div v-for="r in credRows" :key="r.key" class="cred-row">
+            <div class="cred-row-head">
+              <span class="mono cred-key" :class="{ critical: r.critical }">{{ r.key }}</span>
+              <span class="cred-alias">{{ r.label }}</span>
+              <el-tag size="small" type="info" round>{{ r.val.length }}</el-tag>
+              <el-button class="cred-copy" size="small" text type="primary" @click="copyText(r.val)">
+                <el-icon><CopyDocument /></el-icon>复制
+              </el-button>
+            </div>
+            <el-input v-if="r.short" :model-value="r.val" readonly size="small" class="mono" />
+            <el-input v-else :model-value="r.val" type="textarea" :rows="3" readonly class="mono" />
           </div>
-          <el-input :model-value="r.val" type="textarea" :rows="2" readonly class="mono" />
+          <el-empty v-if="!credRows.length" description="无凭证字段" :image-size="70" />
         </div>
-        <el-empty v-if="!credRows.length" description="无凭证字段" />
       </el-dialog>
 
       <!-- 手动编辑凭证：把外部已知的密码/2FA 补进来，或修正记录错误 -->
@@ -611,6 +642,46 @@ onActivated(() => load())
 :deep(.col-ops .cell) {
   padding-left: 8px;
   padding-right: 8px;
+}
+
+/* ── 查看凭证弹窗 ── */
+.cred-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.cred-email {
+  font-weight: 600;
+  word-break: break-all;
+}
+.cred-body {
+  max-height: 68vh;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+.cred-row + .cred-row { margin-top: 14px; }
+.cred-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.cred-key {
+  font-weight: 600;
+  font-size: 13px;
+}
+/* 2FA 密钥标成警示色：这一列抄错一个字符，号就登不上了 */
+.cred-key.critical { color: var(--el-color-warning); }
+.cred-alias {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+/* 复制按钮统一贴右，纵向排成一列，不跟着字段名长短左右乱跳 */
+.cred-copy { margin-left: auto; }
+.cred-row :deep(.el-textarea__inner),
+.cred-row :deep(.el-input__inner) {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
 }
 </style>
 
