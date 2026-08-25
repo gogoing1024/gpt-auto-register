@@ -1,7 +1,7 @@
 **完全无浏览器**：用 `curl_cffi` 模拟 TLS 指纹 + 纯 Python/QuickJS 解 OpenAI Sentinel PoW + IMAP XOAUTH2 取 OTP，直接走 OpenAI authorize 状态机。
 
 含轻量级 **WebUI**：批量导入号池、可视化触发注册、实时 SSE 日志、凭证一键复制。
-**邮箱来源支持双模式**：Outlook 接码池 + CF Worker 自建 catch-all（`cloudflare_temp_email`）。
+**邮箱来源支持三种**：Outlook 接码池 + CF Worker 自建 catch-all（`cloudflare_temp_email`）+ iCloud 隐藏邮件。
 不含支付、daemon、Camoufox、Playwright。
 
 ## 📰 最近更新（2026-07）
@@ -25,18 +25,24 @@
 - 📦 **批量操作**：批量删除号池/凭证 + 按状态批量删
 - ✅ **session_token 三路兜底**：cookie / JSON / domain-free，新号也能拿到
 
-## 🎀 两种使用方式
+## 🎀 快速开始
 
-### A. WebUI 模式（推荐，可视化）
+### WebUI 模式
 
 #### 全新安装
 ```bash
 git clone https://github.com/Regert888/gpt-outlook-register.git
 cd gpt-outlook-register
 pip install -r requirements.txt
+
+# 构建前端（webui/static 是构建产物，不在 git 里，跳过这步页面打不开）
+cd webui/frontend && npm install && npm run build && cd ../..
+
 python start_webui.py
 # 浏览器自动打开 http://127.0.0.1:8765/
 ```
+
+> 前端构建需要 Node.js（≥18）。QuickJS sentinel 路径也要用 node，装一次两边都够用。
 
 **公网启动**：
 ```bash
@@ -116,28 +122,24 @@ WebUI 提供：
 - ▶️ 一键触发注册，实时 SSE 日志（彩色分级）
 - 📤 注册结果表 + 凭证 JSON 复制按钮
 
-### B. 命令行模式（单号注册）
-```bash
-python register_outlook.py 'email----password----client_id----refresh_token'
-```
-
 ## 文件清单
 
-### 核心库（命令行 + WebUI 共用）
+### 核心库
 | 文件 | 行数 | 作用 |
 |---|---|---|
-| `register_outlook.py` | ~100 | **命令行入口**：4 段格式 → `AuthFlow.run_register` → 写出账号 JSON |
-| `auth_flow.py` | ~2790 | **纯协议核心**：csrf → authorize → sentinel → signup → otp → create_account → callback → token exchange |
-| `mail_outlook.py` | ~300 | Outlook IMAP XOAUTH2 取 OTP（refresh_token 续期 + 多 folder + tm1 影子过滤） |
-| `mail_cf.py` | ~260 | CF Worker 自建邮箱 Provider（`cloudflare_temp_email` 兼容；OTP 抽取防误判：HTML span 优先 + 排除邮箱/时间戳/hex 颜色） |
+| `auth_flow.py` | ~3820 | **纯协议核心**：csrf → authorize → sentinel → signup → otp → create_account → callback → token exchange |
+| `mail_providers/base.py` | ~550 | 邮箱 provider 统一基类 + 共用 OTP 抽取（HTML span 优先，排除邮箱/时间戳/hex 颜色） |
+| `mail_providers/outlook.py` | ~650 | Outlook 接码池（Graph API + IMAP XOAUTH2 双通道，refresh_token 续期 + 多 folder + tm1 影子过滤） |
+| `mail_providers/cf_temp.py` | ~400 | CF Worker 自建 catch-all（`cloudflare_temp_email` 兼容），每次新地址 |
+| `mail_providers/icloud_relay.py` | ~310 | iCloud 隐藏邮件（Hide My Email）中转 |
 | `sentinel.py` | ~290 | OpenAI Sentinel Token 纯 Python PoW（FNV-1a 32-bit） |
 | `sentinel_quickjs.py` | ~270 | Sentinel Token QuickJS 路径（跑 OpenAI sdk.js，需要 node） |
 | `openai_sentinel_quickjs.js` | ~400 | QuickJS 路径用的 sdk.js wrapper |
-| `sms_provider.py` | ~700 | **SMS 接码 provider**：BaseSmsProvider + SmsActivate / HeroSMS / SmsBower + PhoneCallbackController |
+| `sms_provider.py` | ~1070 | **SMS 接码 provider**：BaseSmsProvider + SmsActivate / HeroSMS / SmsBower + PhoneCallbackController |
 | `http_client.py` | ~70 | `curl_cffi` Chrome136 TLS 指纹包装 |
 | `config.py` | ~15 | 极简 Config（只留 `proxy` 字段） |
 
-### WebUI（可选）
+### WebUI
 | 文件 | 作用 |
 |---|---|
 | `start_webui.py` | 一键启动脚本（自动装依赖 + 打开浏览器） |
@@ -151,7 +153,7 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 ## 完整协议链路
 
 ```
-register_outlook.py
+webui/registrar.py
     └── AuthFlow(cfg).run_register(mail_provider)
             ├── [1/10] GET  chatgpt.com/api/auth/csrf                       → csrf_token
             ├── [2/10] POST chatgpt.com/api/auth/signin/openai              → auth_url (含 client_id)
@@ -204,20 +206,10 @@ sudo apt-get install -y nodejs
 node --version  # 需要 >= 18
 ```
 
-## 使用
+## 凭证字段
 
-### 1. 单跑 OTP 取码（确认 outlook 接码号能用）
-```bash
-python mail_outlook.py 'email----password----client_id----refresh_token'
-# → OTP: 123456  (需要 OpenAI 已发过码进该邮箱)
-```
+注册成功后凭证落库，在 WebUI「注册结果 → 查看凭证」里查看，或用「导出」批量导出：
 
-### 2. 完整纯协议注册
-```bash
-python register_outlook.py 'email----password----client_id----refresh_token'
-```
-
-成功输出 `account_<email>.json`：
 ```json
 {
   "email": "...",

@@ -8,9 +8,6 @@
 
 能力：pooled=True（号池 claim / 用完 mark_dead）
       ephemeral=False（地址固定，OpenAI 可能当老号处理）
-
-本文件由 mail_outlook.py 迁移而来，取件逻辑逐字保留未改。
-mail_outlook.py 现为转发壳，旧 import 路径继续可用。
 """
 from __future__ import annotations
 

@@ -12,9 +12,6 @@
     api_url          Worker HTTPS 地址（如 https://mail.example.com）
     admin_token      Worker 配置的 ADMIN_PASSWORDS
     domain           主人配的 catch-all 域名（如 example.com）
-
-本文件由 mail_cf.py 迁移而来，取件逻辑逐字保留未改。
-mail_cf.py 现为转发壳，旧 import 路径继续可用。
 """
 from __future__ import annotations
 

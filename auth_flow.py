@@ -659,8 +659,7 @@ class AuthFlow:
         """读配置：本次流程的 env_overrides 优先，回退进程环境变量。
 
         registrar 通过 AuthFlow(env_overrides=...) 传入，不再写 os.environ，
-        所以并发跑多个号时互不干扰。命令行入口（register_outlook.py）没传
-        overrides，行为跟以前完全一样。
+        所以并发跑多个号时互不干扰。不传 overrides 时退化成纯环境变量读取。
         """
         v = self._env_overrides.get(name)
         return os.getenv(name, default) if v is None else str(v)

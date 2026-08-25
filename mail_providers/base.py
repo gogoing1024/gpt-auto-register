@@ -141,7 +141,7 @@ _RE_OTP6 = re.compile(r"(?<!#)(?<!\d)(\d{6})(?!\d)")
 def extract_otp(raw: str, code_pattern: Optional[str] = None) -> Optional[str]:
     """从邮件原文提取 6 位 OTP。
 
-    原本 mail_outlook.py 和 mail_cf.py 各写了一份，规则还不完全一样。
+    早期 outlook / cf_temp 各写了一份，规则还不完全一样。
     收敛到这里，所有 provider 共用同一套防误判逻辑：
 
       1. 优先匹配 <span>XXXXXX</span>（HTML 标签包裹的验证码）
