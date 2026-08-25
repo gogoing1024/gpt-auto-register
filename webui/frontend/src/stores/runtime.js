@@ -20,7 +20,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   const logs = ref([])            // { id, text, kind }
   const autoStatus = ref({ state: 'stopped', registered_ok: 0, registered_fail: 0 })
   const banner = ref('')          // 熔断/严重错误横幅
-  const lastRunResult = ref(null) // { email, password, access_token_len, partial } 或 { error }
+  const lastRunResult = ref(null) // { email, password, totp_secret, access_token_len, partial } 或 { error }
   const dataVersion = ref(0)      // 递增：通知号池/结果/记录表刷新
   const runningSingle = ref(false)
 
@@ -53,6 +53,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
             lastRunResult.value = {
               email: d.email,
               password: d.password || '',
+              totp_secret: d.totp_secret || '',
               access_token_len: d.access_token_len,
               partial: d.partial,
             }

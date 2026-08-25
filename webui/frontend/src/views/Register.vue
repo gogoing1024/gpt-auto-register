@@ -3,8 +3,7 @@ import { onActivated, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
-import { startRegister, getRegistered } from '@/api/register'
-import { copyText } from '@/api/request'
+import { startRegister } from '@/api/register'
 import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
@@ -51,16 +50,6 @@ async function run() {
   }
 }
 
-async function copyField(email, field) {
-  try {
-    const { data } = await getRegistered(email)
-    const val = data[field] || ''
-    if (!val) { ElMessage.warning(`${field} 为空`); return }
-    await copyText(val)
-  } catch (e) {
-    ElMessage.error('加载凭证失败: ' + e.message)
-  }
-}
 </script>
 
 <template>
@@ -108,29 +97,24 @@ async function copyField(email, field) {
           <el-alert
             v-if="lastRunResult && !lastRunResult.error"
             type="success" :closable="false" style="margin-top: 14px"
+            :title="lastRunResult.partial ? '注册完成（部分凭证）' : '注册完成'"
           >
-            注册完成 {{ lastRunResult.email }}
-            (access_token len={{ lastRunResult.access_token_len }}{{ lastRunResult.partial ? ', 部分凭证' : '' }})
-            <div v-if="lastRunResult.password" class="cred-line">
-              <span class="cred-label">密码</span><code class="cred-val">{{ lastRunResult.password }}</code>
-            </div>
-            <div v-else class="cred-line hint">该号未设置密码（服务端未走密码注册流程）</div>
-            <div v-if="lastRunResult.totp_secret" class="cred-line">
-              <span class="cred-label">2FA</span><code class="cred-val">{{ lastRunResult.totp_secret }}</code>
-              <span class="hint" style="margin-left: 6px">仅此一次！务必复制录入验证器</span>
-            </div>
-            <div style="margin-top: 8px">
-              <el-button size="small" @click="copyText(lastRunResult.email)">复制邮箱</el-button>
-              <template v-if="lastRunResult.password">
-                <el-button size="small" type="primary" @click="copyText(lastRunResult.password)">复制密码</el-button>
-                <el-button size="small" @click="copyText(lastRunResult.email + '----' + lastRunResult.password)">
-                  复制 邮箱----密码
-                </el-button>
-              </template>
-              <el-button v-if="lastRunResult.access_token_len > 0" size="small"
-                         @click="copyField(lastRunResult.email, 'access_token')">复制 access_token</el-button>
-              <el-button v-if="lastRunResult.totp_secret" size="small" type="warning"
-                         @click="copyText(lastRunResult.totp_secret)">复制 2FA secret</el-button>
+            <!-- title 只放「注册完成」；凭证走 description 槽，避免和标题挤一行。 -->
+            <div class="run-result">
+              <div class="cred-line">
+                <span class="cred-label">邮箱</span>
+                <code class="cred-val">{{ lastRunResult.email || '—' }}</code>
+              </div>
+              <div class="cred-line">
+                <span class="cred-label">密码</span>
+                <code v-if="lastRunResult.password" class="cred-val">{{ lastRunResult.password }}</code>
+                <span v-else class="hint">未设置</span>
+              </div>
+              <div class="cred-line">
+                <span class="cred-label">2FA</span>
+                <code v-if="lastRunResult.totp_secret" class="cred-val">{{ lastRunResult.totp_secret }}</code>
+                <span v-else class="hint">未绑定</span>
+              </div>
             </div>
           </el-alert>
           <el-alert
@@ -148,3 +132,33 @@ async function copyField(email, field) {
     </el-row>
   </div>
 </template>
+
+<style scoped>
+:deep(.el-alert__content) { width: 100%; }
+:deep(.el-alert__description) {
+  margin-top: 8px;
+  width: 100%;
+}
+
+.run-result {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.run-result .cred-line {
+  margin-top: 0;
+  align-items: flex-start;
+}
+.run-result .cred-label {
+  flex: 0 0 2.5em;
+  white-space: nowrap;
+  line-height: 22px;
+}
+/* .el-alert 是 overflow:hidden，值撑出去不会出滚动条、只会被无声截断，
+   而 2FA secret 少一个字符就等于号废了。min-width:0 让它能收缩，
+   窄窗口下宁可折进自己这行，也不能被剪掉。 */
+.run-result .cred-val {
+  min-width: 0;
+  line-height: 18px;
+}
+</style>

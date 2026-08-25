@@ -469,11 +469,16 @@ onActivated(() => load())
         <el-table-column label="时间" width="160">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="160" fixed="right" class-name="col-ops">
           <template #default="{ row }">
-            <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
-            <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
-            <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            <!-- flex + 取消相邻按钮默认 margin-left，否则「删除」会折到第二行、把行高撑开。
+                 三颗按钮实测 132px（96px 文字 + 6px×2 内边距），配合下面收窄的 cell padding
+                 刚好放进 160，再宽就是一片空白。nowrap 下放不下会裁字，别再往下调。 -->
+            <div class="row-ops">
+              <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
+              <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
+              <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
         <template #empty>
@@ -591,6 +596,22 @@ onActivated(() => load())
   transition: opacity 0.12s;
 }
 :deep(.cell-copy:hover .ico) { opacity: 0.65; }
+
+.row-ops {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  white-space: nowrap;
+}
+.row-ops :deep(.el-button) {
+  margin-left: 0;
+  padding: 0 6px;
+}
+/* 默认 cell 左右各 12px，操作列不需要这么松，省下的 8px 直接换成列宽 */
+:deep(.col-ops .cell) {
+  padding-left: 8px;
+  padding-right: 8px;
+}
 </style>
 
 <!-- 非 scoped：ElMessageBox 是挂到 body 上的，不在本组件的 scope 属性范围内，
