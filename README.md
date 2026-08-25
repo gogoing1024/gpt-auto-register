@@ -93,12 +93,17 @@ cp webui/webui.db webui/webui.db.backup
 # 2. 拉取最新代码
 git pull
 
-# 3. 重启 webui
+# 3. 重新构建前端（webui/static 不进 git，git pull 不会更新页面）
+cd webui/frontend && npm install && npm run build && cd ../..
+
+# 4. 重启 webui
 python start_webui.py
 ```
 
 **说明**：
 - `webui.db` 已在 `.gitignore`，`git pull` **不会覆盖或删除**它
+- 前端构建产物 `webui/static/` 也不在 git 里，**每次 `git pull` 后都要重新构建**，
+  否则页面还是旧版本（或者干脆打不开）。Node 前面已经装过，不需要额外装东西
 - 新版本会自动执行 DB migration（添加新表），**不会删除**已有数据
 - 如果担心出问题，先 `cp webui.db webui.db.backup` 备份
 
@@ -139,9 +144,8 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 | `webui/app.py` | FastAPI 主程序（路由 + SSE 流式日志） |
 | `webui/db.py` | SQLite 号池 + 注册结果存储 |
 | `webui/registrar.py` | 注册任务 worker（独立线程 + 日志回调） |
-| `webui/static/index.html` | 单页 SPA |
-| `webui/static/style.css` | 粉色清爽样式 ~ |
-| `webui/static/app.js` | 前端交互 + SSE 接收 |
+| `webui/frontend/src/` | 前端源码（Vue3 + Element Plus + Vite） |
+| `webui/static/` | 前端构建产物，`npm run build` 生成，**不进 git** |
 | `requirements.txt` | Python 依赖（含 fastapi/uvicorn） |
 
 ## 完整协议链路

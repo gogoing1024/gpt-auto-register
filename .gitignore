@@ -65,6 +65,13 @@ chatgpt_reg_*
 node_modules/
 openai-sentinel-demo/
 
+# ──────────────── 前端构建产物 ────────────────
+# 整个目录由 `cd webui/frontend && npm run build` 生成（vite emptyOutDir=true，
+# 每次构建先清空再写），源码在 webui/frontend/src。之前它进过 git，结果仓库里
+# 攒了两代带 hash 的 chunk、一半早已无人引用。
+# ⚠️ 代价：clone / git pull 之后没有前端，必须先构建一次，否则页面 404。
+webui/static/
+
 # ──────────────── 工作流追踪文件（如果主人启过 AUTH_TRACE_DUMP=1）────────────────
 outputs/
 auth_trace_*.jsonl

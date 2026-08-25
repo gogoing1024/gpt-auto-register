@@ -51,6 +51,13 @@ def main():
     sys.path.insert(0, str(ROOT))
     import uvicorn
 
+    # webui/static 是前端构建产物、不进 git。忘了构建照样能起服务，
+    # 但页面是白的 —— 而后端日志一切正常，很难联想到是少了这一步。
+    if not (ROOT / "webui" / "static" / "index.html").exists():
+        print("\n[!] 没找到前端构建产物 webui/static/index.html，页面打不开。")
+        print("    先构建一次：cd webui/frontend && npm install && npm run build")
+        print("    （只调 API 的话可以忽略）")
+
     url = f"http://{args.host if args.host != '0.0.0.0' else '127.0.0.1'}:{args.port}/"
     print(f"\nChatGPT Register 启动中...")
     print(f"   访问: {url}\n")
