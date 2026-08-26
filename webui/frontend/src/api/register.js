@@ -34,8 +34,8 @@ export { bulkDeleteAccounts } from './accounts'
 export const listExportFormats = () => http.get('/api/registered/export/formats')
 export const exportRegistered = (payload) => http.post('/api/registered/export', payload)
 
-export const checkPlus = (emails, proxy = '') =>
-  http.post('/api/registered/check_plus', { emails, proxy })
+export const checkPlus = (emails, proxy = '', opts = {}) =>
+  http.post('/api/registered/check_plus', { emails, proxy }, opts)
 
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })

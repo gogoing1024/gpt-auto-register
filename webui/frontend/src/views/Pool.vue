@@ -17,7 +17,8 @@ const statsStore = useStatsStore()
 const runtime = useRuntimeStore()
 const { dataVersion } = storeToRefs(runtime)
 
-const PAGE_SIZE = 20
+const PAGE_SIZE_OPTIONS = [50, 100, 500, 1000]
+const pageSize = ref(50)
 const rows = ref([])
 const total = ref(0)
 const page = ref(1)
@@ -58,8 +59,8 @@ async function load(resetPage) {
     const { items, total: t, by_kind } = await listAccounts({
       status: statusFilter.value,
       kind: kindFilter.value,
-      limit: PAGE_SIZE,
-      offset: (page.value - 1) * PAGE_SIZE,
+      limit: pageSize.value,
+      offset: (page.value - 1) * pageSize.value,
     })
     rows.value = items
     total.value = t
@@ -129,6 +130,7 @@ async function deleteOne(email) {
 }
 
 watch(page, () => load())
+watch(pageSize, () => load(true))
 watch(dataVersion, () => load())
 onActivated(() => load())
 loadProviders()
@@ -217,8 +219,9 @@ loadProviders()
 
       <div style="display: flex; justify-content: center; margin-top: 14px">
         <el-pagination
-          v-model:current-page="page" :page-size="PAGE_SIZE" :total="total"
-          layout="prev, pager, next, total" background
+          v-model:current-page="page" v-model:page-size="pageSize"
+          :page-sizes="PAGE_SIZE_OPTIONS" :total="total"
+          layout="sizes, prev, pager, next, total" background
         />
       </div>
     </el-card>

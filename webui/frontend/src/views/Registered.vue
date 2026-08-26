@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, ref, watch } from 'vue'
+import { computed, onActivated, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -23,7 +23,8 @@ const runtime = useRuntimeStore()
 // store 实例上取 —— storeToRefs 只转 state/getter，把 action 解构出来会丢 this。
 const { dataVersion } = storeToRefs(runtime)
 
-const PAGE_SIZE = 20
+const PAGE_SIZE_OPTIONS = [50, 100, 500, 1000]
+const pageSize = ref(50)
 const rows = ref([])
 const total = ref(0)
 const page = ref(1)
@@ -43,12 +44,73 @@ const PLUS_TYPE = {
 }
 function plusOf(row) { return row.plus_check || null }
 
+// 自动检测：按库里的顺序全量查 Plus，已检测的也再跑一遍。
+// 游标写进 form（localStorage）：刷新后按上次最后一个号接着扫，不要从头来。
+// 只有主人把开关关掉再开，才重置到最新一条。扫完一轮从 0 再来。
+const AUTO_BATCH = 5
+const AUTO_NEXT_MS = 800
+const AUTO_IDLE_MS = 10000
+const AUTO_BACKOFF_MS = 20000
+let autoTimer = 0
+let autoBusy = false
+let autoOffset = 0
+let autoResumed = false
+const autoSkipUntil = new Map()
+
+function saveAutoCursor(lastEmail) {
+  form.value.autoCheckOffset = autoOffset
+  if (lastEmail !== undefined) form.value.autoCheckLastEmail = lastEmail || ''
+}
+
+function resetAutoCursor() {
+  autoOffset = 0
+  autoResumed = true
+  saveAutoCursor('')
+}
+
+async function seekAfterEmail(email) {
+  const scan = 100
+  let offset = 0
+  for (let i = 0; i < 50; i++) {
+    const { items, total: t } = await listRegistered({
+      filter: 'all', limit: scan, offset,
+    })
+    if (!items?.length) break
+    const idx = items.findIndex((r) => r.email === email)
+    if (idx >= 0) {
+      autoOffset = offset + idx + 1
+      return
+    }
+    offset += items.length
+    if (offset >= (t || 0)) break
+  }
+  autoOffset = Math.max(0, parseInt(form.value.autoCheckOffset, 10) || 0)
+}
+
+async function ensureAutoResumed() {
+  if (autoResumed) return
+  autoResumed = true
+  const last = String(form.value.autoCheckLastEmail || '').trim()
+  if (last) await seekAfterEmail(last)
+  else autoOffset = Math.max(0, parseInt(form.value.autoCheckOffset, 10) || 0)
+}
+
+function isAutoSkipped(email) {
+  const until = autoSkipUntil.get(email)
+  if (!until) return false
+  if (Date.now() >= until) {
+    autoSkipUntil.delete(email)
+    return false
+  }
+  return true
+}
+
 async function load(resetPage) {
   if (resetPage) page.value = 1
   loading.value = true
   try {
     const { items, total: t } = await listRegistered({
-      limit: PAGE_SIZE, offset: (page.value - 1) * PAGE_SIZE, filter: filter.value,
+      limit: pageSize.value, offset: (page.value - 1) * pageSize.value, filter: filter.value,
     })
     rows.value = items
     total.value = t
@@ -62,36 +124,121 @@ function collectEmails(mode) {
   return rows.value.map((r) => r.email) // all（当前页）
 }
 
-async function doCheck(mode) {
-  const emails = collectEmails(mode)
-  if (!emails.length) { ElMessage.info('当前页没有可检测的号'); return }
-  checking.value = true
-  checkResult.value = `检查中... (${emails.length} 个)`
-  try {
-    const { results, note } = await checkPlus(emails, proxyText(form.value))
-    let plus = 0, free = 0, banned = 0, failed = 0, badToken = 0
-    for (const [email, info] of Object.entries(results)) {
-      const row = rows.value.find((r) => r.email === email)
-      if (row) row.plus_check = info
-      if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
-      else if (info.status === 'banned') banned++
-      else if (info.status === 'free') free++
-      else if (info.status === 'token_invalid') badToken++
-      else if (info.status === 'error') failed++
+function applyCheckResults(results, note) {
+  let plus = 0, free = 0, banned = 0, failed = 0, badToken = 0
+  for (const [email, info] of Object.entries(results)) {
+    const row = rows.value.find((r) => r.email === email)
+    if (row) row.plus_check = info
+    if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
+    else if (info.status === 'banned') banned++
+    else if (info.status === 'free') free++
+    else if (info.status === 'token_invalid') badToken++
+    else if (info.status === 'error') failed++
+    if (info.status === 'no_at' || info.status === 'not_found') {
+      autoSkipUntil.set(email, Date.now() + 60 * 60 * 1000)
+    } else if (info.status === 'error') {
+      autoSkipUntil.set(email, Date.now() + 30 * 1000)
     }
-    // failed / note 不入库，只是这一次的现场说明：
-    // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
-    // badToken 从 2026-08-10 起是**会入库**的结论，措辞也跟着改：
-    // AT 没过期却 401 = 被吊销，大概率就是封号，不该再说得像只是要重新登录。
-    const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
-    if (badToken) parts.push(`${badToken} 个凭证失效（AT 被吊销，多半已封）`)
-    if (failed) parts.push(`${failed} 个没检测成`)
-    if (note) parts.push(note)
-    checkResult.value = parts.join(' · ')
+  }
+  // failed / note 不入库，只是这一次的现场说明：
+  // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
+  // badToken 从 2026-08-10 起是**会入库**的结论，措辞也跟着改：
+  // AT 没过期却 401 = 被吊销，大概率就是封号，不该再说得像只是要重新登录。
+  const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
+  if (badToken) parts.push(`${badToken} 个凭证失效（AT 被吊销，多半已封）`)
+  if (failed) parts.push(`${failed} 个没检测成`)
+  if (note) parts.push(note)
+  checkResult.value = parts.join(' · ')
+  return { note, failed }
+}
+
+async function runCheck(emails, label) {
+  if (!emails.length || checking.value) return null
+  checking.value = true
+  checkResult.value = `${label || '检查中'}... (${emails.length} 个)`
+  try {
+    const { results, note } = await checkPlus(emails, proxyText(form.value), {
+      timeout: Math.min(180000, 30000 + emails.length * 15000),
+    })
+    return applyCheckResults(results || {}, note)
   } catch (e) {
     checkResult.value = ''
     ElMessage.error('检查失败: ' + e.message)
+    return null
   } finally { checking.value = false }
+}
+
+async function doCheck(mode) {
+  const emails = collectEmails(mode)
+  if (!emails.length) { ElMessage.info('当前页没有可检测的号'); return }
+  await runCheck(emails)
+}
+
+function scheduleAutoCheck(delay) {
+  if (autoTimer) clearTimeout(autoTimer)
+  autoTimer = window.setTimeout(() => { autoTick() }, delay)
+}
+
+async function pickAutoEmails(max) {
+  await ensureAutoResumed()
+  const scan = 50
+  const picked = []
+  let total = 0
+  let wrapped = false
+  for (let i = 0; i < 8 && picked.length < max; i++) {
+    const { items, total: t } = await listRegistered({
+      filter: 'all', limit: scan, offset: autoOffset,
+    })
+    total = t || 0
+    if (!total) {
+      resetAutoCursor()
+      wrapped = true
+      break
+    }
+    if (autoOffset >= total || !items?.length) {
+      resetAutoCursor()
+      wrapped = true
+      if (picked.length) break
+      continue
+    }
+    for (const r of items) {
+      autoOffset++
+      if ((r.at_len || 0) <= 0) continue
+      if (isAutoSkipped(r.email)) continue
+      picked.push(r.email)
+      if (picked.length >= max) break
+    }
+  }
+  // 刚收完一轮时游标已经回到 0，不能把本批最后一号写成续扫点，
+  // 否则刷新会从那一号后面接着，新一轮开头被跳过。
+  if (wrapped) saveAutoCursor('')
+  else saveAutoCursor(picked.length ? picked[picked.length - 1] : undefined)
+  return { emails: picked, total }
+}
+
+async function autoTick() {
+  autoTimer = 0
+  if (!form.value.autoCheckPlus) return
+  if (checking.value || autoBusy) {
+    scheduleAutoCheck(1500)
+    return
+  }
+  autoBusy = true
+  try {
+    const { emails, total } = await pickAutoEmails(AUTO_BATCH)
+    if (!emails.length) {
+      if (form.value.autoCheckPlus) scheduleAutoCheck(AUTO_IDLE_MS)
+      return
+    }
+    const r = await runCheck(emails, total ? `全量检测中 ${autoOffset}/${total}` : '全量检测中')
+    await load()
+    if (!form.value.autoCheckPlus) return
+    scheduleAutoCheck(r?.note ? AUTO_BACKOFF_MS : AUTO_NEXT_MS)
+  } catch (_) {
+    if (form.value.autoCheckPlus) scheduleAutoCheck(AUTO_IDLE_MS)
+  } finally {
+    autoBusy = false
+  }
 }
 
 // customClass 里的 pre-line 让消息里的 \n 真的换行。
@@ -364,8 +511,28 @@ async function saveEdit() {
 }
 
 watch(page, () => load())
-watch(dataVersion, () => load())
-onActivated(() => load())
+watch(pageSize, () => load(true))
+watch(dataVersion, () => {
+  load()
+  if (form.value.autoCheckPlus) scheduleAutoCheck(600)
+})
+watch(() => form.value.autoCheckPlus, (on) => {
+  if (on) {
+    resetAutoCursor()
+    checkResult.value = '自动检测已开启，正在全量检测（含已检测）'
+    scheduleAutoCheck(200)
+  } else if (autoTimer) {
+    clearTimeout(autoTimer)
+    autoTimer = 0
+  }
+})
+onActivated(() => {
+  load()
+  if (form.value.autoCheckPlus) scheduleAutoCheck(400)
+})
+onUnmounted(() => {
+  if (autoTimer) clearTimeout(autoTimer)
+})
 </script>
 <template>
   <div class="page">
@@ -396,6 +563,7 @@ onActivated(() => load())
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
           检测选中 ({{ selected.length }})
         </el-button>
+        <el-switch v-model="form.autoCheckPlus" active-text="自动检测" />
         <el-divider direction="vertical" />
         <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
           <el-button :loading="exporting">
@@ -508,8 +676,9 @@ onActivated(() => load())
       </el-table>
       <div style="display: flex; justify-content: center; margin-top: 14px">
         <el-pagination
-          v-model:current-page="page" :page-size="PAGE_SIZE" :total="total"
-          layout="prev, pager, next, total" background
+          v-model:current-page="page" v-model:page-size="pageSize"
+          :page-sizes="PAGE_SIZE_OPTIONS" :total="total"
+          layout="sizes, prev, pager, next, total" background
         />
       </div>
 

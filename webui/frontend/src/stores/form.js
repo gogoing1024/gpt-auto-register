@@ -17,6 +17,11 @@ const defaults = {
   // localStorage 只记住主人上次的选择，不改变默认值：清缓存后两边都回到 true。
   want2fa: true,
   autoWant2fa: true,
+  // 注册结果页：自动全量查 Plus（含已检测）。默认关，避免一打开就打 chatgpt.com。
+  autoCheckPlus: false,
+  // 全量检测游标：刷新后接着上次的号继续，不要从头再扫一遍。
+  autoCheckOffset: 0,
+  autoCheckLastEmail: '',
 }
 
 // el-select 的 clearable 清空时把值写成 **undefined**（不是 ''），而 proxy 在三个
