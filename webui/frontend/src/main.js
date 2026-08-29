@@ -9,7 +9,7 @@ import 'nprogress/nprogress.css'
 
 // 只注册实际用到的图标（动态 <component :is="name"> 需要全局注册）
 import {
-  Platform, Fold, Expand, Moon, Sunny, User, ArrowDown,
+  Fold, Expand, Moon, Sunny, User, ArrowDown,
   Odometer, Upload, VideoPlay, MagicStick, Connection, Files,
   CircleCheck, Document, Message, Iphone, Share,
   Loading, Select, CircleClose, Refresh, CopyDocument,
@@ -20,7 +20,7 @@ import App from './App.vue'
 import router from './router'
 
 const ICONS = {
-  Platform, Fold, Expand, Moon, Sunny, User, ArrowDown,
+  Fold, Expand, Moon, Sunny, User, ArrowDown,
   Odometer, Upload, VideoPlay, MagicStick, Connection, Files,
   CircleCheck, Document, Message, Iphone, Share,
   Loading, Select, CircleClose, Refresh, CopyDocument,
