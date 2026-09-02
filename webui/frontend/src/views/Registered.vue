@@ -46,16 +46,47 @@ function plusOf(row) { return row.plus_check || null }
 
 // 自动检测：按库里的顺序全量查 Plus，已检测的也再跑一遍。
 // 游标写进 form（localStorage）：刷新后按上次最后一个号接着扫，不要从头来。
-// 只有主人把开关关掉再开，才重置到最新一条。扫完一轮从 0 再来。
+// 只有主人把开关关掉再开，才重置到最新一条。
+// 扫完一轮**不再**立刻从 0 再来：以前是一轮接一轮永不停，等于一直在打 chatgpt.com。
+// 现在收完一轮记下时间（也进 localStorage，刷新页面不会重置），
+// 满 AUTO_ROUND_COOLDOWN_HOURS 小时后才自动开下一轮；期间新注册进来的号等下一轮，
+// 急的话手动点「检查未检测」。开关关掉再开 = 主人明确要跑，不受这个限制。
 const AUTO_BATCH = 5
 const AUTO_NEXT_MS = 800
 const AUTO_IDLE_MS = 10000
 const AUTO_BACKOFF_MS = 20000
+const AUTO_ROUND_COOLDOWN_HOURS = 6
+const AUTO_ROUND_COOLDOWN_MS = AUTO_ROUND_COOLDOWN_HOURS * 60 * 60 * 1000
+// 冷却期间不挂一个 6 小时的长 setTimeout：电脑睡眠 / 后台标签页节流会让长定时器
+// 漂得离谱。改成每分钟醒一次看墙上时钟到没到，到点才真正开下一轮。
+const AUTO_COOLDOWN_POLL_MS = 60 * 1000
 let autoTimer = 0
 let autoBusy = false
 let autoOffset = 0
 let autoResumed = false
 const autoSkipUntil = new Map()
+
+// 距本轮冷却结束还有多久（ms），≤0 表示可以开新一轮。
+// 上限卡在一个冷却周期：系统时间被改到未来再改回来时，别让一个诡异的时间戳把检测锁死几天。
+function autoCooldownLeft() {
+  const done = Number(form.value.autoCheckRoundDoneAt) || 0
+  if (!done) return 0
+  return Math.min(done + AUTO_ROUND_COOLDOWN_MS - Date.now(), AUTO_ROUND_COOLDOWN_MS)
+}
+
+function fmtClock(ms) {
+  return new Date(ms).toLocaleString('zh-CN', {
+    hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  })
+}
+
+function showCooldownHint() {
+  const done = Number(form.value.autoCheckRoundDoneAt) || 0
+  if (!done) return
+  checkResult.value =
+    `自动检测本轮已完成（${fmtClock(done)}），` +
+    `${fmtClock(done + AUTO_ROUND_COOLDOWN_MS)} 后自动重新运行（间隔 ${AUTO_ROUND_COOLDOWN_HOURS} 小时）`
+}
 
 function saveAutoCursor(lastEmail) {
   form.value.autoCheckOffset = autoOffset
@@ -191,15 +222,17 @@ async function pickAutoEmails(max) {
     })
     total = t || 0
     if (!total) {
+      // 表是空的：谈不上「一轮」，不算收轮、不进 6 小时冷却，
+      // autoTick 按空闲间隔再看，否则第一个注册进来的号要白等 6 小时。
       resetAutoCursor()
-      wrapped = true
       break
     }
     if (autoOffset >= total || !items?.length) {
+      // 扫到底 = 本轮收工。以前这里 picked 为空会 continue，立刻从 0 接着挑
+      // 下一轮的号，一轮接一轮永不停。现在到此为止，把 wrapped 交给 autoTick 进冷却。
       resetAutoCursor()
       wrapped = true
-      if (picked.length) break
-      continue
+      break
     }
     for (const r of items) {
       autoOffset++
@@ -213,7 +246,7 @@ async function pickAutoEmails(max) {
   // 否则刷新会从那一号后面接着，新一轮开头被跳过。
   if (wrapped) saveAutoCursor('')
   else saveAutoCursor(picked.length ? picked[picked.length - 1] : undefined)
-  return { emails: picked, total }
+  return { emails: picked, total, wrapped }
 }
 
 async function autoTick() {
@@ -223,16 +256,37 @@ async function autoTick() {
     scheduleAutoCheck(1500)
     return
   }
+  // 上一轮收工还没满 6 小时：什么都不查，每分钟醒来看一眼时钟。
+  // 提示只在没别的话可显示时才写（刷新页面回来是空的），
+  // 别把主人刚手动点「检测选中」得到的结果给盖掉。
+  const wait = autoCooldownLeft()
+  if (wait > 0) {
+    if (!checkResult.value) showCooldownHint()
+    scheduleAutoCheck(Math.min(wait, AUTO_COOLDOWN_POLL_MS))
+    return
+  }
   autoBusy = true
   try {
-    const { emails, total } = await pickAutoEmails(AUTO_BATCH)
-    if (!emails.length) {
-      if (form.value.autoCheckPlus) scheduleAutoCheck(AUTO_IDLE_MS)
+    const { emails, total, wrapped } = await pickAutoEmails(AUTO_BATCH)
+    let r = null
+    if (emails.length) {
+      // 收轮那一批游标已经回 0，进度不能显示成 0/total
+      const pos = wrapped ? total : autoOffset
+      r = await runCheck(emails, total ? `全量检测中 ${pos}/${total}` : '全量检测中')
+      await load()
+    }
+    if (!form.value.autoCheckPlus) return
+    if (wrapped) {
+      // 最后一批查完才算本轮结束，从这一刻起算 6 小时
+      form.value.autoCheckRoundDoneAt = Date.now()
+      showCooldownHint()
+      scheduleAutoCheck(AUTO_COOLDOWN_POLL_MS)
       return
     }
-    const r = await runCheck(emails, total ? `全量检测中 ${autoOffset}/${total}` : '全量检测中')
-    await load()
-    if (!form.value.autoCheckPlus) return
+    if (!emails.length) {
+      scheduleAutoCheck(AUTO_IDLE_MS)
+      return
+    }
     scheduleAutoCheck(r?.note ? AUTO_BACKOFF_MS : AUTO_NEXT_MS)
   } catch (_) {
     if (form.value.autoCheckPlus) scheduleAutoCheck(AUTO_IDLE_MS)
@@ -519,6 +573,8 @@ watch(dataVersion, () => {
 watch(() => form.value.autoCheckPlus, (on) => {
   if (on) {
     resetAutoCursor()
+    // 主人亲手关掉再开 = 现在就要跑一轮，6 小时冷却只管「自动」重开
+    form.value.autoCheckRoundDoneAt = 0
     checkResult.value = '自动检测已开启，正在全量检测（含已检测）'
     scheduleAutoCheck(200)
   } else if (autoTimer) {

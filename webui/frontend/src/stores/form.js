@@ -22,6 +22,9 @@ const defaults = {
   // 全量检测游标：刷新后接着上次的号继续，不要从头再扫一遍。
   autoCheckOffset: 0,
   autoCheckLastEmail: '',
+  // 上一轮全量检测收工的时间（ms 时间戳，0 = 还没收过轮）。
+  // 收工后要满 6 小时才自动开下一轮；放这里是为了刷新页面也不会把冷却清掉。
+  autoCheckRoundDoneAt: 0,
 }
 
 // el-select 的 clearable 清空时把值写成 **undefined**（不是 ''），而 proxy 在三个
