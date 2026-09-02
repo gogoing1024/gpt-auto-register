@@ -174,7 +174,8 @@ def import_accounts(text: str, kind: str = "") -> dict:
             relay = r.get("relay_url", "") or ""
 
             cur = con.execute(
-                "SELECT refresh_token, relay_url, kind FROM outlook_accounts WHERE email=?",
+                "SELECT password, refresh_token, relay_url, kind "
+                "FROM outlook_accounts WHERE email=?",
                 (r["email"],),
             )
             existing = cur.fetchone()
@@ -190,6 +191,10 @@ def import_accounts(text: str, kind: str = "") -> dict:
                 (existing["refresh_token"] or "") != refresh
                 or (existing["relay_url"] or "") != relay
                 or (existing["kind"] or "") != row_kind
+                # 密码也是凭证：atomicmail 这类「email----密码」两段格式的号，
+                # 凭证就只有密码一项，不比它的话改了密码重新导入会被当成"没变化"跳过，
+                # 库里留着错密码，主人怎么导都是 401。
+                or (existing["password"] or "") != password
             ):
                 # 凭证或类型变了 → 覆盖并重置为可用
                 con.execute(
