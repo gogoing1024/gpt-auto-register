@@ -112,16 +112,45 @@ def api_import(req: ImportReq):
     return {"ok": True, **result, "stats": db.stats()}
 
 
-@app.get("/api/accounts")
-def api_accounts(status: str = "", limit: int = 50, offset: int = 0, kind: str = ""):
-    items = db.list_accounts(status=status, limit=limit, offset=offset, kind=kind)
-    total = db.count_accounts(status=status, kind=kind)
-    return {
+def _accounts_page(status: str, kind: str, limit: int, offset: int, search: str = "") -> dict:
+    items = db.list_accounts(status=status, limit=limit, offset=offset, kind=kind, search=search)
+    total = db.count_accounts(status=status, kind=kind, search=search)
+    out = {
         "ok": True,
         "items": items,
         "total": total,
         "by_kind": db.stats_by_kind(),
     }
+    if (search or "").strip():
+        out["search"] = db.search_accounts_summary(search)
+    return out
+
+
+@app.get("/api/accounts")
+def api_accounts(status: str = "", limit: int = 50, offset: int = 0, kind: str = ""):
+    return _accounts_page(status, kind, limit, offset)
+
+
+class AccountsQueryReq(BaseModel):
+    status: str = ""
+    kind: str = ""
+    limit: int = Field(50, ge=1, le=5000)
+    offset: int = Field(0, ge=0)
+    # 多行搜索文本，一行一个邮箱 / 片段，可带 ----密码 后缀（见 db.split_search_terms）
+    search: str = ""
+
+
+@app.post("/api/accounts/query")
+def api_accounts_query(req: AccountsQueryReq):
+    """同 GET /api/accounts，多了 search，且参数走 body。
+
+    为什么不直接给 GET 加 search 参数：主人会把几百行邮箱整段粘进搜索框，
+    拼进 URL 轻松超过 uvicorn 16KB 的请求头上限（h11 max_incomplete_event_size），
+    请求直接被掐断。body 没这个问题。
+    """
+    if len(req.search) > 2 * 1024 * 1024:
+        raise HTTPException(400, "搜索内容超过 2 MiB")
+    return _accounts_page(req.status, req.kind, req.limit, req.offset, req.search)
 
 
 @app.delete("/api/accounts/{email}")
@@ -379,11 +408,30 @@ def api_bulk_delete_runs(req: BulkDeleteRunsReq):
     raise HTTPException(400, "需要 run_ids 或 all=true")
 
 
+def _registered_page(limit: int, offset: int, filter_rt: str, search: str = "") -> dict:
+    items = db.list_registered(limit=limit, offset=offset, filter_rt=filter_rt, search=search)
+    total = db.count_registered(filter_rt=filter_rt, search=search)
+    out = {"ok": True, "items": items, "total": total}
+    return out
+
+
 @app.get("/api/registered")
 def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
-    items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
-    total = db.count_registered(filter_rt=filter)
-    return {"ok": True, "items": items, "total": total}
+    return _registered_page(limit, offset, filter)
+
+
+class RegisteredQueryReq(BaseModel):
+    limit: int = Field(50, ge=1, le=5000)
+    offset: int = Field(0, ge=0)
+    filter: str = "all"
+    search: str = ""
+
+
+@app.post("/api/registered/query")
+def api_registered_query(req: RegisteredQueryReq):
+    if len(req.search) > 2 * 1024 * 1024:
+        raise HTTPException(400, "搜索内容超过 2 MiB")
+    return _registered_page(req.limit, req.offset, req.filter, req.search)
 
 
 @app.get("/api/registered/{email}")

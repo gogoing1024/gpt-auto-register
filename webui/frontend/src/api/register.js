@@ -11,7 +11,9 @@ export const bulkDeleteRuns = (payload) =>
 
 // ──────────────── 注册结果 registered ────────────────
 export const listRegistered = (params) =>
-  http.get('/api/registered', { params }) // { limit, offset, filter }
+  (params?.search || '').trim()
+    ? http.post('/api/registered/query', params)
+    : http.get('/api/registered', { params })
 
 export const getRegistered = (email) =>
   http.get(`/api/registered/${encodeURIComponent(email)}`)

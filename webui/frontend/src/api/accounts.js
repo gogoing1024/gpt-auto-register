@@ -9,8 +9,12 @@ export const getStats = () => http.get('/api/stats')
 export const importAccounts = (text, kind = '') =>
   http.post('/api/import', { text, kind })
 
+// { status, limit, offset, kind, search }
+// 带 search 走 POST：搜索框里可能粘着几百行邮箱，拼进 URL 会超过服务端请求头上限。
 export const listAccounts = (params) =>
-  http.get('/api/accounts', { params }) // { status, limit, offset, kind }
+  (params?.search || '').trim()
+    ? http.post('/api/accounts/query', params)
+    : http.get('/api/accounts', { params })
 
 export const deleteAccount = (email) =>
   http.delete(`/api/accounts/${encodeURIComponent(email)}`)

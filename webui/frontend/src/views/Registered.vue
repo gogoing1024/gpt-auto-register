@@ -34,6 +34,12 @@ const loading = ref(false)
 const checking = ref(false)
 const checkResult = ref('')
 
+// 按邮箱搜索
+const searchText = ref('')
+const appliedSearch = ref('')
+const searchActive = computed(() => !!appliedSearch.value)
+const isSearchFocused = ref(false)
+
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
   // token_invalid（401 且响应体没有封号措辞）仍与 banned 分开显示——判据不同，
@@ -140,13 +146,53 @@ async function load(resetPage) {
   if (resetPage) page.value = 1
   loading.value = true
   try {
-    const { items, total: t } = await listRegistered({
+    const { items, total: t, search } = await listRegistered({
       limit: pageSize.value, offset: (page.value - 1) * pageSize.value, filter: filter.value,
+      search: appliedSearch.value,
     })
     rows.value = items
     total.value = t
   } catch (e) { ElMessage.error(e.message) }
   finally { loading.value = false }
+}
+
+function doSearch() {
+  appliedSearch.value = searchText.value.trim()
+  load(true)
+}
+
+function clearSearch() {
+  searchText.value = ''
+  if (!appliedSearch.value) return
+  appliedSearch.value = ''
+  load(true)
+}
+
+// 监听搜索框的清空事件 (点击右侧 ✖ 图标时触发)
+watch(searchText, (val) => {
+  if (!val && appliedSearch.value) {
+    clearSearch()
+  }
+})
+
+function onSearchPaste(e) {
+  const text = e.clipboardData?.getData('text') || ''
+  if (text.includes('\n') || text.includes('----')) {
+    e.preventDefault()
+    const cleaned = text.split(/\r?\n/)
+      .map(line => line.split('----')[0].trim())
+      .filter(Boolean)
+      .join(' ')
+    if (!cleaned) return
+    const input = e.target
+    const start = input.selectionStart || 0
+    const end = input.selectionEnd || 0
+    const prefix = searchText.value.slice(0, start)
+    const suffix = searchText.value.slice(end)
+    const padLeft = (prefix && !prefix.endsWith(' ')) ? ' ' : ''
+    const padRight = (suffix && !suffix.startsWith(' ')) ? ' ' : ''
+    searchText.value = prefix + padLeft + cleaned + padRight + suffix
+  }
 }
 
 function collectEmails(mode) {
@@ -595,12 +641,35 @@ onUnmounted(() => {
     <el-card shadow="never">
       <template #header><span class="section-title" style="margin: 0">注册结果</span></template>
 
+      <!-- 按邮箱搜索 -->
+      <div class="search-row">
+        <div class="search-wrap">
+          <el-input
+            v-model="searchText" type="textarea" class="mono search-box"
+            :class="{ 'is-focused': isSearchFocused }"
+            autosize resize="none"
+            placeholder="按邮箱搜索：一行一个"
+            @keydown.enter.ctrl.prevent="doSearch"
+            @keydown.enter.meta.prevent="doSearch"
+            @focus="isSearchFocused = true"
+            @blur="isSearchFocused = false"
+            @paste="onSearchPaste"
+          />
+        </div>
+        <div class="search-btns">
+          <el-button type="primary" @click="doSearch"><el-icon><Search /></el-icon>搜索</el-button>
+          <el-button v-if="searchText || searchActive" @click="clearSearch">清除</el-button>
+        </div>
+      </div>
+
       <el-space wrap style="margin-bottom: 12px">
         <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
         <el-select v-model="filter" style="width: 130px" @change="load(true)">
           <el-option label="全部" value="all" />
           <el-option label="有 RT" value="has_rt" />
           <el-option label="无 RT" value="no_rt" />
+          <el-option label="无 密码" value="no_password" />
+          <el-option label="无 2FA" value="no_2fa" />
           <el-option label="未检测" value="unchecked" />
           <el-option label="Free" value="free" />
           <el-option label="可领Plus" value="plus" />
@@ -727,7 +796,10 @@ onUnmounted(() => {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="暂无注册结果，去「单次注册」或「全自动批量」跑号" :image-size="70" />
+          <el-empty
+            :description="searchActive ? '没有匹配的凭证（换个条件，或点「清除」看全部）' : '暂无注册结果，去「单次注册」或「全自动批量」跑号'"
+            :image-size="70"
+          />
         </template>
       </el-table>
       <div style="display: flex; justify-content: center; margin-top: 14px">
@@ -831,6 +903,51 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.search-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.search-wrap {
+  position: relative;
+  width: 520px;
+  height: 32px;
+  max-width: 100%;
+}
+.search-box {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  transition: box-shadow 0.2s;
+}
+.search-box.is-focused {
+  z-index: 100;
+}
+.search-box.is-focused :deep(.el-textarea__inner) {
+  box-shadow: var(--el-box-shadow-light);
+  overflow: hidden !important;
+}
+.search-box:not(.is-focused) :deep(.el-textarea__inner) {
+  height: 32px !important;
+  min-height: 32px !important;
+  line-height: 20px !important;
+  padding-top: 5px !important;
+  padding-bottom: 5px !important;
+  overflow: hidden !important;
+  white-space: nowrap;
+}
+.search-box :deep(.el-textarea__inner) {
+  font-size: 12px;
+  line-height: 1.5;
+}
+.search-btns {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 /* 表格里「点一下就复制」的明文单元格（密码 / 2FA secret）。
    :deep 是必需的：.el-button 由 Element Plus 渲染，scoped 的属性选择器打不到它。
 

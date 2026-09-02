@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -210,9 +211,53 @@ def import_accounts(text: str, kind: str = "") -> dict:
     return {"parsed": len(rows), "inserted": inserted, "updated": updated, "skipped": skipped}
 
 
-def count_accounts(status: str = "", kind: str = "") -> int:
-    con = _conn()
-    sql = "SELECT COUNT(*) FROM outlook_accounts"
+# 一次搜索最多认多少个条件。和导入上限一致：主人最多也就把整个 emails.txt 粘进来。
+# SQLite 单条语句变量上限 32766（3.32+），5000 个 IN 参数远够；再多就是误操作。
+SEARCH_MAX_TERMS = 5000
+
+_RE_TERM_SPLIT = re.compile(r"[,;\s]+")
+
+
+def _like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def split_search_terms(search: str) -> tuple[list[str], list[str]]:
+    """把多行搜索文本拆成 (完整邮箱 → 精确匹配, 片段 → 子串匹配)。
+
+    规则：
+      · 一行一个条件；一行里有 ---- 的只取第一段 —— 主人会把 emails.txt /
+        导出文件的行整段粘进来，后面的密码/token 不该参与匹配。
+      · 同一行里再按 逗号 / 分号 / 空白 切：邮箱里不会出现这些字符。
+      · 完整邮箱走 = 而不是 LIKE：多行粘 50 个邮箱进来是为了圈出这 50 个再批量
+        删 / 重置，ann@x.com 要是把 joann@x.com 也搂进来，全选一删就误伤了。
+        片段（没 @ 或域名不完整）才走 %片段%。
+      · 统一小写（parse_line 入库时就是小写的），去重，超过上限的直接丢。
+    """
+    from mail_providers import validate_email
+
+    exact: list[str] = []
+    partial: list[str] = []
+    seen: set[str] = set()
+    for raw in (search or "").splitlines():
+        head = raw.split("----", 1)[0]
+        for term in _RE_TERM_SPLIT.split(head):
+            term = term.strip().lower()
+            if not term or term in seen:
+                continue
+            if len(exact) + len(partial) >= SEARCH_MAX_TERMS:
+                return exact, partial
+            seen.add(term)
+            try:
+                validate_email(term)
+                exact.append(term)
+            except ValueError:
+                partial.append(term)
+    return exact, partial
+
+
+def _accounts_where(status: str, kind: str, search: str = "") -> tuple[str, list]:
+    """list_accounts / count_accounts 共用的 WHERE，两边条件必须一致，否则总数和页对不上。"""
     where, args = [], []
     if status:
         where.append("status=?")
@@ -220,28 +265,57 @@ def count_accounts(status: str = "", kind: str = "") -> int:
     if kind:
         where.append("kind=?")
         args.append(kind.strip().lower())
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    return con.execute(sql, args).fetchone()[0]
+    if (search or "").strip():
+        exact, partial = split_search_terms(search)
+        ors = []
+        if exact:
+            ors.append(f"email IN ({','.join('?' * len(exact))})")
+            args += exact
+        for p in partial:
+            ors.append("email LIKE ? ESCAPE '\\'")
+            args.append(f"%{_like_escape(p)}%")
+        # 搜了但一个有效条件都没拆出来（比如只粘了分隔符）→ 空结果，
+        # 不能悄悄退化成"全部"，否则主人以为搜到了、其实看的是整个池子
+        where.append("(" + " OR ".join(ors) + ")" if ors else "0")
+    return (" WHERE " + " AND ".join(where)) if where else "", args
+
+
+def count_accounts(status: str = "", kind: str = "", search: str = "") -> int:
+    con = _conn()
+    where, args = _accounts_where(status, kind, search)
+    return con.execute("SELECT COUNT(*) FROM outlook_accounts" + where, args).fetchone()[0]
 
 
 def list_accounts(
-    status: str = "", limit: int = 50, offset: int = 0, kind: str = ""
+    status: str = "", limit: int = 50, offset: int = 0, kind: str = "", search: str = ""
 ) -> list[dict]:
     con = _conn()
-    sql = "SELECT * FROM outlook_accounts"
-    where, args = [], []
-    if status:
-        where.append("status=?")
-        args.append(status)
-    if kind:
-        where.append("kind=?")
-        args.append(kind.strip().lower())
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY imported_at DESC LIMIT ? OFFSET ?"
-    args += [limit, offset]
-    return [dict(r) for r in con.execute(sql, args).fetchall()]
+    where, args = _accounts_where(status, kind, search)
+    sql = "SELECT * FROM outlook_accounts" + where + " ORDER BY imported_at DESC LIMIT ? OFFSET ?"
+    return [dict(r) for r in con.execute(sql, args + [limit, offset]).fetchall()]
+
+
+def _search_summary_for_table(table: str, search: str) -> dict:
+    exact, partial = split_search_terms(search)
+    found: set[str] = set()
+    if exact:
+        con = _conn()
+        for i in range(0, len(exact), 500):
+            part = exact[i:i + 500]
+            cur = con.execute(
+                f"SELECT email FROM {table} WHERE email IN ({','.join('?' * len(part))})",
+                part,
+            )
+            found.update(r["email"] for r in cur.fetchall())
+    return {
+        "exact": len(exact),
+        "partial": len(partial),
+        "missing": [e for e in exact if e not in found],
+    }
+
+
+def search_accounts_summary(search: str) -> dict:
+    return _search_summary_for_table("outlook_accounts", search)
 
 
 def stats_by_kind() -> dict:
@@ -743,41 +817,64 @@ def update_plus_check(email: str, plus_info: dict) -> None:
         con.commit()
 
 
-def _registered_where(filt: str) -> str:
+def _registered_where(filt: str, search: str = "") -> tuple[str, list]:
+    where_clauses = []
+    args = []
+
     if filt == "has_rt":
-        return "WHERE length(refresh_token) > 0"
-    if filt == "no_rt":
-        return "WHERE coalesce(length(refresh_token),0) = 0"
-    if filt == "unchecked":
-        return "WHERE (extra_json IS NULL OR extra_json NOT LIKE '%\"plus_check\"%')"
-    if filt == "free":
-        return "WHERE extra_json LIKE '%\"free\"%'"
-    if filt == "plus":
-        return "WHERE (extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')"
-    if filt == "banned":
-        return "WHERE extra_json LIKE '%\"banned\"%'"
-    if filt == "token_invalid":
+        where_clauses.append("length(refresh_token) > 0")
+    elif filt == "no_rt":
+        where_clauses.append("coalesce(length(refresh_token),0) = 0")
+    elif filt == "unchecked":
+        where_clauses.append("(extra_json IS NULL OR extra_json NOT LIKE '%\"plus_check\"%')")
+    elif filt == "free":
+        where_clauses.append("extra_json LIKE '%\"free\"%'")
+    elif filt == "plus":
+        where_clauses.append("(extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')")
+    elif filt == "banned":
+        where_clauses.append("extra_json LIKE '%\"banned\"%'")
+    elif filt == "no_password":
+        where_clauses.append("coalesce(length(password), 0) = 0")
+    elif filt == "no_2fa":
+        where_clauses.append("coalesce(length(totp_secret), 0) = 0")
+    elif filt == "token_invalid":
         # token_invalid 从 2026-08-10 起会写库，得能筛出来，否则等于埋了：
         # 它既不在 unchecked 里（已有结论），又不在 free/plus/banned 里。
-        return "WHERE extra_json LIKE '%\"token_invalid\"%'"
-    return ""
+        where_clauses.append("extra_json LIKE '%\"token_invalid\"%'")
+
+    if (search or "").strip():
+        exact, partial = split_search_terms(search)
+        ors = []
+        if exact:
+            ors.append(f"email IN ({','.join('?' * len(exact))})")
+            args += exact
+        for p in partial:
+            ors.append("email LIKE ? ESCAPE '\\'")
+            args.append(f"%{_like_escape(p)}%")
+        
+        where_clauses.append("(" + " OR ".join(ors) + ")" if ors else "0")
+
+    if where_clauses:
+        return "WHERE " + " AND ".join(where_clauses), args
+    return "", args
 
 
-def count_registered(filter_rt: str = "all") -> int:
+def count_registered(filter_rt: str = "all", search: str = "") -> int:
     con = _conn()
-    cur = con.execute(f"SELECT COUNT(*) FROM registered {_registered_where(filter_rt)}")
+    where, args = _registered_where(filter_rt, search)
+    cur = con.execute(f"SELECT COUNT(*) FROM registered {where}", args)
     return cur.fetchone()[0]
 
 
-def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
+def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all", search: str = "") -> list[dict]:
     con = _conn()
-    where = _registered_where(filter_rt)
+    where, args = _registered_where(filter_rt, search)
     cur = con.execute(
         f"SELECT email, password, totp_secret, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "
         f"length(refresh_token) AS rt_len, extra_json, created_at FROM registered "
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (limit, offset),
+        args + [limit, offset],
     )
     rows = []
     for r in cur.fetchall():
