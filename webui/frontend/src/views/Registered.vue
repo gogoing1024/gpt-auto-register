@@ -659,11 +659,12 @@ onUnmounted(() => {
         <div class="search-btns">
           <el-button type="primary" @click="doSearch"><el-icon><Search /></el-icon>搜索</el-button>
           <el-button v-if="searchText || searchActive" @click="clearSearch">清除</el-button>
+          <!-- 刷新挪到搜索行：下面那条工具栏少一个按钮，「自动检测」的位置就稳定了 -->
+          <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
         </div>
       </div>
 
-      <el-space wrap style="margin-bottom: 12px">
-        <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
+      <el-space wrap class="toolbar" style="margin-bottom: 12px">
         <el-select v-model="filter" style="width: 130px" @change="load(true)">
           <el-option label="全部" value="all" />
           <el-option label="有 RT" value="has_rt" />
@@ -689,7 +690,10 @@ onUnmounted(() => {
           检测选中 ({{ selected.length }})
         </el-button>
         <el-switch v-model="form.autoCheckPlus" active-text="自动检测" />
-        <el-divider direction="vertical" />
+      </el-space>
+
+      <!-- 导出 / 删除单独一行：跟上面的检测区分开，互相不会因为换行挤来挤去 -->
+      <el-space wrap class="toolbar" style="margin-bottom: 12px">
         <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
           <el-button :loading="exporting">
             <el-icon><Download /></el-icon>{{ exportBtnText }}
@@ -946,6 +950,15 @@ onUnmounted(() => {
   display: flex;
   gap: 8px;
   flex-shrink: 0;
+}
+/* el-space 的每一项都是 display:flex，且给子元素塞了 flex:1（= flex:1 1 0%，
+   见 element-plus 的 .el-space__item>*）。于是行宽不够时控件是被**压窄**而不是换行，
+   开关的 active-text「自动检测」就被折成两行。禁止收缩：放不下就整项换行。 */
+.toolbar :deep(.el-space__item) {
+  flex-shrink: 0;
+}
+.toolbar :deep(.el-switch__label) {
+  white-space: nowrap;
 }
 
 /* 表格里「点一下就复制」的明文单元格（密码 / 2FA secret）。
