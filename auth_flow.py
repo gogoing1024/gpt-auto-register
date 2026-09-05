@@ -992,6 +992,39 @@ class AuthFlow:
         )
 
     @staticmethod
+    def _is_add_password_page(page_type: str = "", continue_url: str = "") -> bool:
+        # 2026-09-05 实抓：post_login_add_password + OTP/TOTP 之后落地
+        # page.type=reset_password_new_password
+        # continue_url=https://auth.openai.com/reset-password/new-password
+        # 尽管 URL 带 reset-password，这是补密页，不是改密 API。
+        pt = (page_type or "").strip().lower()
+        cu = (continue_url or "").strip().lower()
+        return (
+            pt in (
+                "reset_password_new_password",
+                "add_password",
+                "create_password",
+                "create_account_password",
+                "password_add",
+            )
+            or "/reset-password/new-password" in cu
+            or "/add-password" in cu
+            or "/password/add" in cu
+            or "/create-account/password" in cu
+        )
+
+    @staticmethod
+    def _add_password_referer(continue_url: str = "") -> str:
+        url = (continue_url or "").strip()
+        if (
+            url.startswith("https://auth.openai.com/")
+            and "callback" not in url.lower()
+            and "/api/" not in url.lower()
+        ):
+            return url.split("?", 1)[0]
+        return "https://auth.openai.com/reset-password/new-password"
+
+    @staticmethod
     def _extract_page_payload(resp_json: dict | None) -> dict:
         if not isinstance(resp_json, dict):
             return {}
@@ -1047,13 +1080,23 @@ class AuthFlow:
         logger.warning(f"登录 OTP 首次 resend 失败 (mode={mode})，再 resend 一次（不 send）")
         return self.resend_otp("https://auth.openai.com/email-verification")
 
-    def _wait_and_verify_login_otp(self, mail_provider: MailProvider, mode: str = "login_need_otp") -> dict:
+    def _wait_and_verify_login_otp(
+        self,
+        mail_provider: MailProvider,
+        mode: str = "login_need_otp",
+        *,
+        already_sent: bool = False,
+    ) -> dict:
         if mail_provider is None:
             raise RuntimeError("登录需要 OTP，但未提供 mail_provider")
         email = (self.result.email or "").strip()
         otp_timeout = self._otp_timeout()
         otp_sent_at = time.time()
-        if not self._kickoff_login_otp(mode):
+        if already_sent:
+            # 补密二次 authorize/continue 已经发码；立刻 resend 会 429。
+            otp_sent_at = time.time() - 8
+            logger.info("authorize/continue 已发 OTP，先等邮件不 resend")
+        elif not self._kickoff_login_otp(mode):
             # authorize/continue 往往已经发过码，resend 全失败也先等短窗口
             otp_sent_at = time.time() - 8
             logger.warning("登录 OTP resend 未成功，按 authorize 已发码等待邮件")
@@ -2158,6 +2201,59 @@ class AuthFlow:
         logger.debug(f"Auth URL: {auth_url[:80]}...")
         return auth_url
 
+    def get_add_password_auth_url(self, csrf_token: str, email: str) -> str:
+        """已登录 chatgpt.com 后，按官方补密入口再开一条 OAuth。
+
+        对照 changepwd.txt 模式 1：
+        connection=password&reauth=password&max_age=0&post_login_add_password=true
+        最终应对准 POST /api/accounts/password/add，不是 user/register。
+        """
+        email = (email or self.result.email or "").strip()
+        if not email:
+            raise RuntimeError("补密 signin 缺少邮箱")
+        logger.info("[补密] 获取 post_login_add_password 授权地址...")
+        headers = self._common_headers("https://chatgpt.com/")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if not self.result.device_id:
+            self.result.device_id = str(uuid.uuid4())
+        query_params: dict[str, str] = {
+            "connection": "password",
+            "login_hint": email,
+            "reauth": "password",
+            "max_age": "0",
+            "post_login_add_password": "true",
+            "ext-oai-did": self.result.device_id,
+            "auth_session_logging_id": str(uuid.uuid4()),
+            "ext-passkey-client-capabilities": "1111",
+        }
+        signin_url = f"https://chatgpt.com/api/auth/signin/openai?{urlencode(query_params)}"
+        resp = self.session.post(
+            signin_url,
+            headers=headers,
+            data={
+                "csrfToken": csrf_token,
+                "callbackUrl": "https://chatgpt.com/",
+                "json": "true",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        self._trace_http("chatgpt_signin_openai_add_password", resp)
+        auth_url = ""
+        try:
+            payload = resp.json() if resp is not None else {}
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            auth_url = (payload.get("url") or payload.get("redirect") or "").strip()
+        if not auth_url:
+            raise RuntimeError("补密 Auth URL 获取失败")
+        self._remember_oauth_params(auth_url)
+        auth_url = self._inject_pkce_into_auth_url(auth_url)
+        self._remember_oauth_params(auth_url)
+        logger.info(f"补密 Auth URL: {auth_url[:120]}...")
+        return auth_url
+
     # ── Step 4: OAuth 初始化 & 获取 device_id ──
     def auth_oauth_init(self, auth_url: str) -> str:
         """跟随 authorize 链，落 authorize 会话状态并取回 oai-did。
@@ -2185,6 +2281,9 @@ class AuthFlow:
         headers.pop("sec-fetch-user", None)
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
+        final_url = str(getattr(resp, "url", "") or "")
+        if "rate_limit" in final_url.lower() or "error?payload=" in final_url.lower():
+            raise RuntimeError(f"OAuth 初始化被拒绝: {final_url[:180]}")
 
         # oai-did 在 .chatgpt.com / .openai.com 会各有一份，不能 cookies.get("oai-did")
         device_id = self._get_cookie_value_by_name("oai-did")
@@ -2270,13 +2369,23 @@ class AuthFlow:
             "username": {"value": email, "kind": "email"},
             "screen_hint": screen_hint,
         }
-        resp = self.session.post(
-            "https://auth.openai.com/api/accounts/authorize/continue",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        self._trace_http(trace_step or f"authorize_continue_{screen_hint}", resp)
+        resp = None
+        for attempt in range(3):
+            resp = self.session.post(
+                "https://auth.openai.com/api/accounts/authorize/continue",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            self._trace_http(trace_step or f"authorize_continue_{screen_hint}", resp)
+            if resp.status_code != 429:
+                break
+            wait = 20 * (attempt + 1)
+            logger.warning(
+                "authorize/continue 429 rate_limit，%ss 后重试 (%s/3)",
+                wait, attempt + 1,
+            )
+            time.sleep(wait)
         if resp.status_code != 200:
             body = (resp.text or "")[:360]
             # 额外打日志：headers/req_id 帮排查是不是 IP 风控
@@ -2431,6 +2540,208 @@ class AuthFlow:
             except Exception as e:
                 logger.warning(f"密码落盘回调失败（不影响注册，日志里还有兜底）: {e}")
         return True
+
+    def _refresh_sentinel_for_flow(self, flow_name: str) -> str:
+        """刷指定 flow 的 sentinel。SO token 规则与 register_password 相同。"""
+        so_token_for_request = getattr(self, "_last_sentinel_so_token", "")
+        if not self.result.device_id:
+            return so_token_for_request
+        try:
+            from sentinel import get_sentinel_token as _get_st
+            token, so_token = _get_st(
+                self.session,
+                device_id=self.result.device_id,
+                flow=flow_name,
+                **self._sentinel_fp_kwargs(),
+            )
+            self._last_sentinel_token = token or ""
+            so_token_for_request = so_token or ""
+            if so_token:
+                self._last_sentinel_so_token = so_token
+        except Exception as e:
+            logger.warning(f"刷新 sentinel({flow_name}) 失败，沿用现有 token: {e}")
+        return so_token_for_request
+
+    def add_password(self, email: str, password: str, continue_url: str = "") -> bool:
+        """已登录无密号补设密码。最终 POST /api/accounts/password/add。
+
+        2026-09-05 实抓成功组合：
+        - Referer: https://auth.openai.com/reset-password/new-password
+        - sentinel flow=username_password_create（服务端不下发 SO）
+        - body={"password": ...}，不要带 username
+        - 200 后 page.type=external_url，continue_url 是 chatgpt callback
+        """
+        email = (email or self.result.email or "").strip()
+        password = (password or "").strip()
+        if not email or not password:
+            raise RuntimeError("补密缺少邮箱或密码")
+
+        referer = self._add_password_referer(continue_url)
+        logger.info(f"[补密] POST password/add referer={referer}")
+        try:
+            pw_page = self.session.get(
+                referer,
+                headers=self._common_headers("https://auth.openai.com/"),
+                timeout=15,
+            )
+            logger.info(f"补密页面: {pw_page.status_code} {str(getattr(pw_page, 'url', '') or referer)[:120]}")
+        except Exception as e:
+            logger.warning(f"访问补密页失败: {e}")
+
+        payload = {"password": password}
+        so_token_for_request = self._refresh_sentinel_for_flow("username_password_create")
+        headers = self._common_headers(referer)
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if so_token_for_request:
+            headers["openai-sentinel-so-token"] = so_token_for_request
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/password/add",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        self._trace_http(
+            "add_password",
+            resp,
+            extra_request={
+                "method": "POST",
+                "url": "https://auth.openai.com/api/accounts/password/add",
+                "body": '{"password":"***"}',
+                "headers": headers,
+            },
+        )
+        body = (resp.text or "")[:220]
+        logger.info("password/add status=%s body=%s", resp.status_code, body)
+        if resp.status_code != 200:
+            if resp.status_code in (401, 403) and "deactivat" in (resp.text or "").lower():
+                _raise_auth_error("补密失败", resp.status_code, resp.text or "")
+            logger.warning(f"password/add 失败: {resp.status_code} {body}")
+            return False
+
+        logger.info("补密成功")
+        if self._on_password is not None:
+            try:
+                self._on_password(email, password)
+            except Exception as e:
+                logger.warning(f"补密落盘回调失败: {e}")
+        try:
+            data = resp.json() if resp.text else {}
+        except Exception:
+            data = {}
+        cb = self._extract_continue_url_from_step(data) if isinstance(data, dict) else ""
+        if cb and "/api/auth/callback/openai" in cb and "code=" in cb:
+            try:
+                self._consume_callback_for_session(cb)
+                self.get_auth_session()
+            except Exception as e:
+                logger.warning(f"补密后刷新 chatgpt session 失败（密码已生效）: {e}")
+        return True
+
+    def _resolve_set_password(self, email: str, password: str = "") -> tuple[str, str]:
+        """补密用密码：入参 > 本轮 result > 库内预设 > 随机。返回 (密码, 来源)。"""
+        pwd = (password or "").strip()
+        if pwd:
+            return pwd, "入参"
+        pwd = (self.result.password or "").strip()
+        if pwd:
+            return pwd, "本轮"
+        if self._account_callback:
+            try:
+                cred = self._account_callback(email) or {}
+                pwd = (cred.get("password") or "").strip()
+                if pwd:
+                    return pwd, "库内预设"
+            except Exception as e:
+                logger.warning(f"account_callback 加载补密密码异常: {e}")
+        return self._random_password(), "随机生成"
+
+    def _advance_add_password_oauth(self, mail_provider: MailProvider, email: str) -> str:
+        """chatgpt 已登录后，再开 post_login_add_password OAuth，走完 OTP/2FA。
+
+        实抓顺序：signin(add_password) → oauth init(email-verification) →
+        authorize/continue(又一次 passwordless OTP) → OTP → TOTP →
+        reset_password_new_password。设密前不能消费 chatgpt callback。
+        """
+        csrf = self.get_csrf_token()
+        auth_url = self.get_add_password_auth_url(csrf, email)
+        self.auth_oauth_init(auth_url)
+        self.fetch_client_auth_session_dump("add_password_oauth")
+
+        device_id = (self.result.device_id or "").strip() or self._get_cookie_value_by_name("oai-did")
+        if not device_id:
+            device_id = str(uuid.uuid4())
+            self.result.device_id = device_id
+
+        sentinel = self.get_sentinel_token(device_id)
+        step = self.authorize_continue(
+            email=email,
+            sentinel_token=sentinel,
+            screen_hint="login",
+            referer="https://auth.openai.com/log-in",
+            trace_step="authorize_continue_add_password",
+        )
+
+        page_type = (self._extract_page_type(step) or "").lower()
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+        payload = self._extract_page_payload(step)
+        mode = (payload.get("email_verification_mode") or "").strip().lower()
+        logger.info(
+            "补密 OAuth 落地 page_type=%s mode=%s continue=%s",
+            page_type or "(empty)",
+            mode or "(empty)",
+            (continue_url or "")[:180] or "(empty)",
+        )
+
+        if self._is_add_password_page(page_type, continue_url):
+            return self._add_password_referer(continue_url)
+
+        if self._is_password_login_page(page_type, continue_url):
+            raise RuntimeError("补密 OAuth 落到密码登录页，该号可能已在 OpenAI 设密")
+
+        if self._is_otp_login_page(page_type, continue_url) or mode == "passwordless_login":
+            otp_resp = self._wait_and_verify_login_otp(
+                mail_provider, "add_password", already_sent=True,
+            )
+            page_type = (self._extract_page_type(otp_resp) or "").lower()
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+
+        page_type, continue_url = self._submit_mfa_if_needed(page_type, continue_url, email)
+        if self._is_add_password_page(page_type, continue_url):
+            return self._add_password_referer(continue_url)
+        if continue_url and "/api/auth/callback/openai" in continue_url:
+            raise RuntimeError("补密 OAuth 在设密前就跳回 chatgpt callback，未落到设密页")
+        raise RuntimeError(
+            f"补密未落到设密页 page={page_type or '(empty)'} "
+            f"url={(continue_url or '')[:160] or '(empty)'}"
+        )
+
+    def run_set_password(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str = "",
+    ) -> AuthResult:
+        """无密号协议登录后补设密码。密码优先库内预设，没有再随机。"""
+        if not (email or "").strip():
+            raise RuntimeError("run_set_password 缺少邮箱")
+        email = email.strip()
+        self.run_protocol_login(mail_provider, email)
+        if self.result.password_on_openai is True:
+            raise RuntimeError("该号已在 OpenAI 设密，无需补密")
+        if self.result.password_on_openai is not False:
+            logger.warning("本轮未明确探测到无密，仍尝试补密")
+
+        pwd, source = self._resolve_set_password(email, password)
+        logger.info(f"[补密] 密码来源: {source}")
+        landing = self._advance_add_password_oauth(mail_provider, email)
+        if not self.add_password(email, pwd, continue_url=landing):
+            raise RuntimeError("password/add 失败，OpenAI 侧仍无密码")
+        self.result.password = pwd
+        self.result.password_on_openai = True
+        logger.info("补密流程完成")
+        return self.result
 
     # ── Step 7: 发送 OTP ──
     def send_otp(self, referer: str = "https://auth.openai.com/create-account/password"):

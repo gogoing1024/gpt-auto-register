@@ -6,7 +6,7 @@ import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
   listExportFormats, exportRegistered, updateCredentials,
-  startReauth,
+  startReauth, startSetPassword,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore, proxyText } from '@/stores/form'
@@ -25,26 +25,37 @@ const runtime = useRuntimeStore()
 // store 实例上取 —— storeToRefs 只转 state/getter，把 action 解构出来会丢 this。
 const { runningReauth, lastReauthResult, reauthBatch, dataVersion, reauthRestoreOpen } = storeToRefs(runtime)
 
+function jobLabel(action) {
+  return action === 'set_password' ? '设置密码' : '重新授权'
+}
+function batchAction() {
+  return reauthBatch.value?.action || 'reauth'
+}
+function isNoOpenAiPassword(row) {
+  return row && row.password_on_openai === false
+}
+
 const reauthAlert = computed(() => {
   const b = reauthBatch.value || {}
+  const label = jobLabel(b.action)
   const finished = (b.ok || 0) + (b.fail || 0)
   const idx = Math.min(finished + (b.current ? 1 : 0), b.total || 0)
   if (!b.done) {
     return {
       type: 'info',
-      title: `重新授权进行中 ${idx}/${b.total}`,
+      title: `${label}进行中 ${idx}/${b.total}`,
       desc: `成功 ${b.ok || 0}`
         + (b.fail ? ` / 失败 ${b.fail}` : '')
         + (b.current ? ` · 当前 ${b.current}` : ''),
     }
   }
   if (b.fail && b.ok) {
-    return { type: 'warning', title: '重新授权部分完成', desc: `成功 ${b.ok} / 失败 ${b.fail}` }
+    return { type: 'warning', title: `${label}部分完成`, desc: `成功 ${b.ok} / 失败 ${b.fail}` }
   }
   if (b.fail) {
-    return { type: 'error', title: '重新授权失败', desc: `失败 ${b.fail}` + (b.ok ? ` / 成功 ${b.ok}` : '') }
+    return { type: 'error', title: `${label}失败`, desc: `失败 ${b.fail}` + (b.ok ? ` / 成功 ${b.ok}` : '') }
   }
-  return { type: 'success', title: '重新授权完成', desc: `成功 ${b.ok || 0}` }
+  return { type: 'success', title: `${label}完成`, desc: `成功 ${b.ok || 0}` }
 })
 
 const PAGE_SIZE_OPTIONS = [50, 100, 500, 1000]
@@ -388,22 +399,25 @@ const reauthTitle = ref('重新授权')
 
 function openReauthDialog(title) {
   if (title) reauthTitle.value = title
-  else if (!reauthTitle.value) reauthTitle.value = '重新授权'
+  else if (!reauthTitle.value) reauthTitle.value = jobLabel(batchAction())
   reauthVisible.value = true
   runtime.ackReauthRestore()
 }
 
-async function startReauthEmails(emails) {
+async function startAuthEmails(emails, action = 'reauth') {
   const list = [...new Set((emails || []).map((e) => String(e || '').trim().toLowerCase()).filter(Boolean))]
-  if (!list.length) { ElMessage.info('没有要重新授权的号'); return }
-  if (runningReauth.value) { ElMessage.warning('已有重新授权任务在跑，等当前日志结束后再点'); return }
-  reauthTitle.value = list.length === 1 ? `重新授权 · ${list[0]}` : `重新授权 · ${list.length} 个号`
+  const label = jobLabel(action)
+  const tag = action === 'set_password' ? 'setpwd' : 'reauth'
+  if (!list.length) { ElMessage.info(`没有要${label}的号`); return }
+  if (runningReauth.value) { ElMessage.warning(`已有${label}任务在跑，等当前日志结束后再点`); return }
+  reauthTitle.value = list.length === 1 ? `${label} · ${list[0]}` : `${label} · ${list.length} 个号`
   runtime.clearReauthLogs()
   lastReauthResult.value = null
   reauthVisible.value = true
-  runtime.beginReauthBatch(list.length, list[0])
+  runtime.beginReauthBatch(list.length, list[0], action)
   try {
-    const r = await startReauth({
+    const api = action === 'set_password' ? startSetPassword : startReauth
+    const r = await api({
       emails: list,
       proxy: proxyText(form.value),
       otp_timeout: parseInt(form.value.otpTimeout, 10) || 180,
@@ -411,9 +425,9 @@ async function startReauthEmails(emails) {
       want_session_token: true,
       want_refresh_token: true,
     })
-    runtime.addLog(`[reauth] 已排队 ${list.length} 个号，先跑 ${r.email || list[0]} (run=${r.run_id})`, 'evt', 'reauth')
+    runtime.addLog(`[${tag}] 已排队 ${list.length} 个号，先跑 ${r.email || list[0]} (run=${r.run_id})`, 'evt', 'reauth')
     if (r.email || list[0]) {
-      reauthBatch.value = { ...reauthBatch.value, current: r.email || list[0] }
+      reauthBatch.value = { ...reauthBatch.value, current: r.email || list[0], action }
     }
     if (r.run_id) runtime.streamRun(r.run_id, 0, { channel: 'reauth' })
   } catch (e) {
@@ -426,18 +440,32 @@ async function startReauthEmails(emails) {
 
 async function reauthOne(email) {
   if (!(await confirm(`重新授权 ${email}？\n会走 OpenAI 登录（密码页或邮箱验证码，如有 2FA 再过 TOTP）刷新凭证。号池状态不变。`))) return
-  await startReauthEmails([email])
+  await startAuthEmails([email], 'reauth')
 }
 
 async function reauthSelected() {
   const emails = selected.value.map((r) => r.email)
   if (!emails.length) { ElMessage.info('请先勾选要重新授权的号'); return }
   if (!(await confirm(`重新授权选中的 ${emails.length} 个号？按顺序执行，号池状态不变。`))) return
-  await startReauthEmails(emails)
+  await startAuthEmails(emails, 'reauth')
+}
+
+async function setPasswordOne(row) {
+  if (!isNoOpenAiPassword(row)) { ElMessage.info('该号已在 OpenAI 设密'); return }
+  if (!(await confirm(`给 ${row.email} 设置密码？\n登录走邮箱验证码（有 2FA 再过 TOTP）。优先用库里已有密码，没有则随机生成。`))) return
+  await startAuthEmails([row.email], 'set_password')
+}
+
+async function setPasswordSelected() {
+  const emails = selected.value.filter(isNoOpenAiPassword).map((r) => r.email)
+  if (!emails.length) { ElMessage.info('请先勾选「未在 OpenAI 设密」的号'); return }
+  if (!(await confirm(`给选中的 ${emails.length} 个无密号设置密码？优先用库里已有密码，没有则随机生成。`))) return
+  await startAuthEmails(emails, 'set_password')
 }
 
 function onRowMore(cmd, row) {
   if (cmd === 'reauth') reauthOne(row.email)
+  else if (cmd === 'set_password') setPasswordOne(row)
   else if (cmd === 'edit') openEdit(row)
   else if (cmd === 'delete') deleteOne(row.email)
 }
@@ -727,9 +755,10 @@ onActivated(async () => {
   if (reauthRestoreOpen.value || runningReauth.value) {
     const n = reauthBatch.value?.total || 0
     const email = reauthBatch.value?.current || lastReauthResult.value?.email
+    const label = jobLabel(batchAction())
     openReauthDialog(
-      n > 1 ? `重新授权 · ${n} 个号`
-        : email ? `重新授权 · ${email}` : '重新授权',
+      n > 1 ? `${label} · ${n} 个号`
+        : email ? `${label} · ${email}` : label,
     )
   }
 })
@@ -737,9 +766,10 @@ watch(reauthRestoreOpen, (v) => {
   if (v) {
     const n = reauthBatch.value?.total || 0
     const email = reauthBatch.value?.current || lastReauthResult.value?.email
+    const label = jobLabel(batchAction())
     openReauthDialog(
-      n > 1 ? `重新授权 · ${n} 个号`
-        : email ? `重新授权 · ${email}` : '重新授权',
+      n > 1 ? `${label} · ${n} 个号`
+        : email ? `${label} · ${email}` : label,
     )
   }
 })
@@ -807,6 +837,14 @@ onUnmounted(() => {
           @click="reauthSelected"
         >
           重新授权选中 ({{ selected.length }})
+        </el-button>
+        <el-button
+          type="warning" plain
+          :loading="runningReauth"
+          :disabled="!selected.filter(isNoOpenAiPassword).length"
+          @click="setPasswordSelected"
+        >
+          设置密码选中 ({{ selected.filter(isNoOpenAiPassword).length }})
         </el-button>
         <el-switch v-model="form.autoCheckPlus" active-text="自动检测" />
       </el-space>
@@ -916,6 +954,11 @@ onUnmounted(() => {
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="reauth" :disabled="runningReauth">重新授权</el-dropdown-item>
+                    <el-dropdown-item
+                      v-if="isNoOpenAiPassword(row)"
+                      command="set_password"
+                      :disabled="runningReauth"
+                    >设置密码</el-dropdown-item>
                     <el-dropdown-item command="edit">编辑</el-dropdown-item>
                     <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
                   </el-dropdown-menu>

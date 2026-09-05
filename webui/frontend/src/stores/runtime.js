@@ -29,7 +29,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   const banner = ref('')
   const lastRunResult = ref(null)
   const lastReauthResult = ref(null)
-  const reauthBatch = ref({ total: 0, ok: 0, fail: 0, current: '', done: false })
+  const reauthBatch = ref({ total: 0, ok: 0, fail: 0, current: '', done: false, action: 'reauth' })
   const dataVersion = ref(0)
   const runningSingle = ref(false)
   const runningReauth = ref(false)
@@ -71,7 +71,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
     runningReauth.value = rea > 0 || reauthBatching
   }
 
-  function beginReauthBatch(total = 0, current = '') {
+  function beginReauthBatch(total = 0, current = '', action = 'reauth') {
     reauthBatching = true
     runningReauth.value = true
     reauthBatch.value = {
@@ -80,6 +80,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
       fail: 0,
       current: current || '',
       done: false,
+      action: action || 'reauth',
     }
     lastReauthResult.value = null
   }
@@ -95,6 +96,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
       fail: Number(d.fail) || 0,
       current: d.current || '',
       done: !active && total > 0,
+      action: d.action || reauthBatch.value.action || 'reauth',
     }
     if (active) {
       reauthBatching = true
@@ -113,7 +115,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   }
   function abortReauthBatch() {
     reauthBatching = false
-    reauthBatch.value = { total: 0, ok: 0, fail: 0, current: '', done: false }
+    reauthBatch.value = { total: 0, ok: 0, fail: 0, current: '', done: false, action: 'reauth' }
     syncRunning()
   }
 
@@ -309,7 +311,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
       reauth_run_started: (e) => {
         try {
           const d = JSON.parse(e.data)
-          addLog(`[reauth] 开始 ${d.email} (run=${d.run_id})`, 'evt', 'reauth')
+          const tag = (reauthBatch.value.action === 'set_password') ? 'setpwd' : 'reauth'
+          addLog(`[${tag}] 开始 ${d.email} (run=${d.run_id})`, 'evt', 'reauth')
           if (d.email) reauthBatch.value = { ...reauthBatch.value, current: d.email, done: false }
           streamRun(d.run_id, 0, { channel: 'reauth' })
         } catch (_) {}
@@ -317,7 +320,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
       reauth_run_finished: (e) => {
         try {
           const d = JSON.parse(e.data)
-          addLog(`[reauth] ${d.ok ? '[成功]' : '[失败]'} ${d.email}`, d.ok ? 'ok' : 'err', 'reauth')
+          const tag = (reauthBatch.value.action === 'set_password') ? 'setpwd' : 'reauth'
+          addLog(`[${tag}] ${d.ok ? '[成功]' : '[失败]'} ${d.email}`, d.ok ? 'ok' : 'err', 'reauth')
           useStatsStore().refresh()
           bumpData()
         } catch (_) {}
@@ -325,7 +329,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
       reauth_batch_done: (e) => {
         try {
           const d = JSON.parse(e.data || '{}')
-          addLog(`[reauth] 队列结束${d.n ? ` (共 ${d.n} 个号)` : ''}`, 'evt', 'reauth')
+          const tag = (reauthBatch.value.action === 'set_password') ? 'setpwd' : 'reauth'
+          addLog(`[${tag}] 队列结束${d.n ? ` (共 ${d.n} 个号)` : ''}`, 'evt', 'reauth')
         } catch (_) {}
         endReauthBatch()
       },

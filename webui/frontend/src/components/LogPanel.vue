@@ -9,12 +9,15 @@ const props = defineProps({
 })
 
 const runtime = useRuntimeStore()
-const { logs, reauthLogs } = storeToRefs(runtime)
+const { logs, reauthLogs, reauthBatch } = storeToRefs(runtime)
 const { form } = storeToRefs(useFormStore())
 const boxRef = ref(null)
 
 const lines = computed(() => (props.source === 'reauth' ? reauthLogs.value : logs.value))
-const title = computed(() => (props.source === 'reauth' ? '重新授权日志' : '实时日志'))
+const title = computed(() => {
+  if (props.source !== 'reauth') return '实时日志'
+  return reauthBatch.value?.action === 'set_password' ? '设置密码日志' : '重新授权日志'
+})
 const autoScroll = computed(() => !!form.value.logAutoScroll)
 
 function clear() {

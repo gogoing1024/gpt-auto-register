@@ -932,27 +932,53 @@ class ReauthReq(BaseModel):
     want_refresh_token: bool = True
 
 
-@app.post("/api/registered/reauth")
-def api_reauth(req: ReauthReq):
-    """注册结果页重新授权：不 claim 号池，走协议登录刷新 token。"""
+def _start_registered_auth(req: ReauthReq, *, action: str):
     emails = [(e or "").strip().lower() for e in (req.emails or []) if (e or "").strip()]
+    label = "设置密码" if action == "set_password" else "重新授权"
     if not emails:
-        raise HTTPException(400, "没有要重新授权的邮箱")
+        raise HTTPException(400, f"没有要{label}的邮箱")
+    if action == "set_password":
+        keep = []
+        for email in emails:
+            saved = db.get_registered(email) or {}
+            if saved.get("password_on_openai") is True:
+                continue
+            keep.append(email)
+        if not keep:
+            raise HTTPException(400, "选中的号都已在 OpenAI 设密")
+        emails = keep
     options = {
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
         "proxy": req.proxy,
         "otp_timeout": int(req.otp_timeout or 180),
+        "action": action,
     }
     try:
-        run_id = registrar.start_reauth(emails, options)
+        if action == "set_password":
+            run_id = registrar.start_set_password(emails, options)
+        else:
+            run_id = registrar.start_reauth(emails, options)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(409, str(e))
-    logger.info(f"[reauth] {run_id} -> {emails[0]}" + (f" +{len(emails)-1} queued" if len(emails) > 1 else ""))
+    tag = "setpwd" if action == "set_password" else "reauth"
+    logger.info(f"[{tag}] {run_id} -> {emails[0]}" + (f" +{len(emails)-1} queued" if len(emails) > 1 else ""))
     return {"ok": True, "run_id": run_id, "email": emails[0], "emails": emails}
+
+
+@app.post("/api/registered/reauth")
+def api_reauth(req: ReauthReq):
+    """注册结果页重新授权：不 claim 号池，走协议登录刷新 token。"""
+    return _start_registered_auth(req, action="reauth")
+
+
+@app.post("/api/registered/set_password")
+def api_set_password(req: ReauthReq):
+    """给「未在 OpenAI 设密」的号补密码。登录复用重新授权，最终 password/add。"""
+    return _start_registered_auth(req, action="set_password")
 
 
 # ──────────────────────── Plus 试用检查 ────────────────────────

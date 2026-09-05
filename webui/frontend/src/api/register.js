@@ -43,6 +43,7 @@ export const checkPlus = (emails, proxy = '', opts = {}) =>
   http.post('/api/registered/check_plus', { emails, proxy }, opts)
 
 export const startReauth = (payload) => http.post('/api/registered/reauth', payload)
+export const startSetPassword = (payload) => http.post('/api/registered/set_password', payload)
 
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })

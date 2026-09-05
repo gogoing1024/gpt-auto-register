@@ -1154,7 +1154,7 @@ def list_runs(limit: int = 50, status: str = "", kind: str = "") -> list[dict]:
         clauses.append("status=?")
         args.append(want)
     if kind_f == "reauth":
-        clauses.append("kind='reauth'")
+        clauses.append("kind IN ('reauth','setpwd')")
     elif kind_f == "register":
         # 老行 kind 为空，一律算注册，避免误进重新授权面板
         clauses.append("(kind IS NULL OR kind='' OR kind='register')")

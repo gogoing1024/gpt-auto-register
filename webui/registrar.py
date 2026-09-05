@@ -626,6 +626,20 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
         pass
 
 
+def _save_set_password_early(email: str, password: str) -> None:
+    """password/add 200 后立刻写密码并标记已在 OpenAI 设密。"""
+    log = logging.getLogger("registrar")
+    try:
+        db.save_reauth_result({
+            "email": email,
+            "password": password,
+            "password_on_openai": True,
+        })
+        log.info(f"[设置密码] 密码已落盘并标记已设密: {email}")
+    except Exception as e:
+        log.warning(f"[设置密码] 密码落盘失败，仅剩日志兜底: {e}")
+
+
 def _save_password_early(email: str, password: str) -> None:
     """AuthFlow 的 on_password 回调：密码在 OpenAI 侧一生效就落盘。
 
@@ -713,7 +727,21 @@ _reauth_batch: dict = {
     "ok": 0,
     "fail": 0,
     "current": "",
+    "action": "reauth",
 }
+
+
+def _reauth_action(options: Optional[dict] = None) -> str:
+    action = ((options or {}).get("action") or "reauth").strip()
+    return "set_password" if action == "set_password" else "reauth"
+
+
+def _reauth_label(action: str) -> str:
+    return "设置密码" if action == "set_password" else "重新授权"
+
+
+def _reauth_tag(action: str) -> str:
+    return "setpwd" if action == "set_password" else "reauth"
 
 
 def get_reauth_snapshot() -> dict:
@@ -793,20 +821,23 @@ def _wait_run_finish(run_id: str, timeout: int = 1800) -> None:
 
 def _start_reauth_one(email: str, options: dict) -> str:
     """一个邮箱一条 run / 一份日志，和全自动每个号一个 register run 一样。"""
+    action = _reauth_action(options)
+    label = _reauth_label(action)
+    kind = _reauth_tag(action)
     with _lock:
         if email in _reauth_locks:
-            raise RuntimeError("正在重新授权，请稍后再试: " + email)
+            raise RuntimeError(f"正在{label}，请稍后再试: " + email)
         _reauth_locks.add(email)
     try:
         run_id = uuid.uuid4().hex[:12]
         log_file = LOG_DIR / f"{run_id}.log"
-        db.create_run(run_id, email, str(log_file), kind="reauth")
+        db.create_run(run_id, email, str(log_file), kind=kind)
         _mark_run_started(run_id)
         threading.Thread(
             target=_do_reauth,
             args=(run_id, email, options, log_file),
             daemon=True,
-            name=f"reauth-{run_id}",
+            name=f"{kind}-{run_id}",
         ).start()
         _note_reauth_progress(current=email)
         _broadcast_reauth("run_started", {"email": email, "run_id": run_id})
@@ -818,7 +849,9 @@ def _start_reauth_one(email: str, options: dict) -> str:
 
 
 def start_reauth(emails: list[str], options: dict) -> str:
-    """启动重新授权（不 claim 号池）。每个邮箱一个 run；多个则顺序排队。"""
+    """启动重新授权或设置密码（不 claim 号池）。每个邮箱一个 run；多个则顺序排队。"""
+    action = _reauth_action(options)
+    label = _reauth_label(action)
     cleaned = []
     seen = set()
     for raw in emails or []:
@@ -828,19 +861,19 @@ def start_reauth(emails: list[str], options: dict) -> str:
         seen.add(em)
         cleaned.append(em)
     if not cleaned:
-        raise ValueError("没有要重新授权的邮箱")
+        raise ValueError(f"没有要{label}的邮箱")
 
     n = len(cleaned)
     with _reauth_batch_lock:
         if _reauth_batch.get("active"):
-            raise RuntimeError("已有重新授权队列在跑")
-        _reauth_batch.update(active=True, total=n, ok=0, fail=0, current="")
+            raise RuntimeError("已有重新授权或设置密码队列在跑")
+        _reauth_batch.update(active=True, total=n, ok=0, fail=0, current="", action=action)
     _broadcast_reauth("state", get_reauth_snapshot())
     try:
         first_id = _start_reauth_one(cleaned[0], options)
     except Exception:
         with _reauth_batch_lock:
-            _reauth_batch.update(active=False, total=0, ok=0, fail=0, current="")
+            _reauth_batch.update(active=False, total=0, ok=0, fail=0, current="", action="reauth")
         _broadcast_reauth("state", get_reauth_snapshot())
         raise
 
@@ -851,7 +884,9 @@ def start_reauth(emails: list[str], options: dict) -> str:
                 try:
                     rid = _start_reauth_one(email, options)
                 except Exception as e:
-                    logging.getLogger("registrar").exception(f"[reauth] 启动失败: {email}")
+                    logging.getLogger("registrar").exception(
+                        f"[{_reauth_tag(_reauth_action(options))}] 启动失败: {email}"
+                    )
                     _note_reauth_progress(finished_ok=False)
                     _broadcast_reauth("run_finished", {
                         "email": email, "run_id": "", "ok": False, "error": str(e),
@@ -859,7 +894,9 @@ def start_reauth(emails: list[str], options: dict) -> str:
                     continue
                 _wait_run_finish(rid)
         except Exception:
-            logging.getLogger("registrar").exception("[reauth] 批量排队异常")
+            logging.getLogger("registrar").exception(
+                f"[{_reauth_tag(_reauth_action(options))}] 批量排队异常"
+            )
         finally:
             snap = _note_reauth_progress(done=True)
             _broadcast_reauth("batch_done", {
@@ -868,8 +905,14 @@ def start_reauth(emails: list[str], options: dict) -> str:
                 "fail": snap.get("fail") or 0,
             })
 
-    threading.Thread(target=_rest, daemon=True, name="reauth-batch").start()
+    threading.Thread(target=_rest, daemon=True, name=f"{_reauth_tag(action)}-batch").start()
     return first_id
+
+
+def start_set_password(emails: list[str], options: dict) -> str:
+    opts = dict(options or {})
+    opts["action"] = "set_password"
+    return start_reauth(emails, opts)
 
 
 def _do_reauth(run_id: str, email: str, options: dict, log_file: Path) -> None:
@@ -884,20 +927,27 @@ def _do_reauth(run_id: str, email: str, options: dict, log_file: Path) -> None:
 
     log = logging.getLogger("registrar")
     ok = False
+    action = _reauth_action(options)
+    tag = _reauth_tag(action)
+    saved_password = ""
 
     try:
-        _emit_status(run_id, "phase", {"phase": "reauth", "email": email})
-        log.info(f"[reauth] 开始: {email}")
+        _emit_status(run_id, "phase", {"phase": tag, "email": email})
+        log.info(f"[{tag}] 开始: {email}")
         _reauth_one(run_id, email, options)
-        log.info(f"[reauth] 完成: {email}")
+        if action == "set_password":
+            saved = db.get_registered(email) or {}
+            saved_password = (saved.get("password") or "").strip()
+        log.info(f"[{tag}] 完成: {email}")
         db.finish_run(run_id, "done")
         _emit_status(run_id, "done", {
             "email": email,
-            "password": "",
+            "password": saved_password if action == "set_password" else "",
             "totp_secret": "",
             "access_token_len": 0,
             "partial": False,
             "reauth": True,
+            "set_password": action == "set_password",
             "ok": 1,
             "fail": 0,
         })
@@ -907,11 +957,11 @@ def _do_reauth(run_id: str, email: str, options: dict, log_file: Path) -> None:
         # 兜底认字符串：密码页、无密码 OTP、TOTP 都可能返回同一个 403，
         # 漏掉哪条分支都会让封号号显示成普通失败。
         if isinstance(e, AccountDeactivatedError) or _looks_deactivated(err):
-            log.error(f"[reauth] 封号 {email}: {err}")
+            log.error(f"[{tag}] 封号 {email}: {err}")
             _mark_registered_banned(email, err)
             db.finish_run(run_id, "failed", err, category="account")
         else:
-            log.error(f"[reauth] 失败 {email}: {err}")
+            log.error(f"[{tag}] 失败 {email}: {err}")
             log.error(traceback.format_exc())
             db.finish_run(run_id, "failed", err, category="unknown")
         _emit_status(run_id, "error", {"message": err, "email": email})
@@ -933,6 +983,8 @@ def _do_reauth(run_id: str, email: str, options: dict, log_file: Path) -> None:
 
 
 def _reauth_one(run_id: str, email: str, options: dict) -> None:
+    action = _reauth_action(options)
+    tag = _reauth_tag(action)
     account = db.get_account(email)
     if not account:
         raise RuntimeError("号池里没有该邮箱的接码信息，无法收 OTP")
@@ -940,7 +992,12 @@ def _reauth_one(run_id: str, email: str, options: dict) -> None:
     kind = (account.get("kind") or "").strip() or db.get_setting("mail_source", "outlook")
     mail = create_mail_provider(kind, db.get_mail_settings(), account)
     log = logging.getLogger("registrar")
-    log.info(f"[reauth] 邮箱来源: {kind} ({mail.display_name})")
+    log.info(f"[{tag}] 邮箱来源: {kind} ({mail.display_name})")
+
+    if action == "set_password":
+        saved_probe = db.get_registered(email) or {}
+        if saved_probe.get("password_on_openai") is True:
+            raise RuntimeError("该号已在 OpenAI 设密，跳过")
 
     env_overrides = {
         "WEBUI_ALLOW_LOGIN": "1",
@@ -963,7 +1020,7 @@ def _reauth_one(run_id: str, email: str, options: dict) -> None:
                     "totp_secret": data.get("totp_secret", ""),
                 }
         except Exception as e:
-            log.warning(f"[reauth] account_callback 异常: {e}")
+            log.warning(f"[{tag}] account_callback 异常: {e}")
         return {}
 
     flow = AuthFlow(
@@ -971,12 +1028,16 @@ def _reauth_one(run_id: str, email: str, options: dict) -> None:
         sms_callback=_build_sms_callback(run_id),
         env_overrides=env_overrides,
         account_callback=_account_callback_for_flow,
+        on_password=_save_set_password_early if action == "set_password" else None,
     )
     saved = db.get_registered(email) or {}
     if saved.get("totp_secret"):
         flow.result.totp_secret = saved.get("totp_secret") or ""
 
-    result = flow.run_protocol_login(mail, email)
+    if action == "set_password":
+        result = flow.run_set_password(mail, email)
+    else:
+        result = flow.run_protocol_login(mail, email)
     d = result.to_dict()
     d["email"] = (d.get("email") or email).lower()
     if not options.get("want_access_token", True):
@@ -987,13 +1048,17 @@ def _reauth_one(run_id: str, email: str, options: dict) -> None:
     if not options.get("want_refresh_token", True):
         d.pop("refresh_token", None)
         d.pop("id_token", None)
-    # 无密探测成功时不要把库内残留密码写进 result 再落库成「本轮密码」
-    if d.get("password_on_openai") is False:
+    if action == "set_password":
+        if d.get("password_on_openai") is not True or not (d.get("password") or "").strip():
+            raise RuntimeError("补密未成功，OpenAI 侧仍无密码")
+    elif d.get("password_on_openai") is False:
+        # 无密探测成功时不要把库内残留密码写进 result 再落库成「本轮密码」
         d["password"] = ""
     db.save_reauth_result(d)
     log.info(
-        f"[reauth] 已更新凭证 email={d.get('email')} "
+        f"[{tag}] 已更新凭证 email={d.get('email')} "
         f"pw_on_openai={d.get('password_on_openai')} "
+        f"pw={'有' if (d.get('password') or '').strip() else '无'} "
         f"at={len(d.get('access_token') or '')} "
         f"st={len(d.get('session_token') or '')} "
         f"rt={len(d.get('refresh_token') or '')}"

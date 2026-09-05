@@ -156,16 +156,20 @@ class ICloudProvider(MailProvider):
     def create_mailbox(self) -> str:
         return self.email
 
-    def _fetch(self) -> str:
-        req = urllib.request.Request(self.relay_url, headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json, */*;q=0.8",
-            "Cache-Control": "no-cache",
-        })
+    def _mail_session(self):
+        sess = getattr(self, "_http", None)
+        if sess is not None:
+            return sess
+        try:
+            from http_client import create_http_session
+            sess = create_http_session()
+        except Exception:
+            sess = None
+        self._http = sess
+        return sess
+
+    def _fetch_urllib(self, headers: dict) -> str:
+        req = urllib.request.Request(self.relay_url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self.http_timeout) as r:
                 return r.read().decode("utf-8", errors="replace")
@@ -178,6 +182,35 @@ class ICloudProvider(MailProvider):
                     fatal=True, kind=self.kind,
                 ) from e
             raise
+
+    def _fetch(self) -> str:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, */*;q=0.8",
+            "Cache-Control": "no-cache",
+        }
+        sess = self._mail_session()
+        if sess is not None:
+            try:
+                resp = sess.get(self.relay_url, headers=headers, timeout=self.http_timeout)
+                if resp.status_code == 404:
+                    return json.dumps({"email": self.email, "message": None})
+                if resp.status_code in (401, 403, 410):
+                    raise MailProviderError(
+                        f"取件链接无效（HTTP {resp.status_code}）—— token 可能过期或链接填错了",
+                        fatal=True, kind=self.kind,
+                    )
+                resp.raise_for_status()
+                return resp.text or ""
+            except MailProviderError:
+                raise
+            except Exception as e:
+                logger.debug("[icloud] cffi 取件失败，改 urllib: %s", e)
+        return self._fetch_urllib(headers)
 
     def _latest(self) -> Optional[dict]:
         try:
