@@ -11,9 +11,11 @@ import asyncio
 import base64
 import json
 import logging
+import queue
 import sys
 import time
 import uuid
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -335,37 +337,98 @@ def api_register(req: RegisterReq):
     return {"ok": True, "run_id": run_id, "email": account["email"]}
 
 
+def _sse_from_log_line(line: str, offset: int = 0) -> str:
+    if line.startswith(registrar.EVENT_PREFIX):
+        return f"event: status\ndata: {line[len(registrar.EVENT_PREFIX):]}\n\n"
+    return (
+        "event: log\n"
+        f"data: {json.dumps({'line': line, 'offset': offset}, ensure_ascii=False)}\n\n"
+    )
+
+
+def _iter_new_log_lines(run_id: str, offset: int):
+    """读出 offset 之后的完整行，返回 (sse_chunks, next_offset)。run 没了则 next_offset 为 None。"""
+    chunk = registrar.read_run_log(run_id, offset=offset, tail=0)
+    if chunk is None:
+        return None, None
+    nxt = chunk["next_offset"]
+    return [_sse_from_log_line(line, nxt) for line in chunk["lines"]], nxt
+
+
+@app.get("/api/runs/{run_id}/logs")
+def api_run_logs(run_id: str, offset: int = 0, tail: int = 2000):
+    """回放某个 run 的日志文件，给 F5 后的前端先填面板。"""
+    data = registrar.read_run_log(run_id, offset=offset, tail=max(0, int(tail or 0)))
+    if data is None:
+        raise HTTPException(404, "run_id not found")
+    return {"ok": True, **data}
+
+
 @app.get("/api/runs/{run_id}/stream")
-async def api_stream(run_id: str, request: Request):
-    """SSE 实时推送日志 + 事件。"""
-    q = registrar.get_run_queue(run_id)
-    if q is None:
-        raise HTTPException(404, "run_id not found or finished")
+async def api_stream(run_id: str, request: Request, offset: int = 0):
+    """SSE：从文件 offset 起 tail。断开只退订，不拆 run。"""
+    loop = asyncio.get_event_loop()
+    # 读库/读文件不能占事件循环：重新授权写库时这里一旦堵 30s，
+    # 整站包括 /api/registered 都会一起转圈。
+    probe = await loop.run_in_executor(
+        None, partial(registrar.read_run_log, run_id, 0, 0),
+    )
+    if probe is None:
+        raise HTTPException(404, "run_id not found")
 
     async def event_gen():
-        loop = asyncio.get_event_loop()
+        pos = max(0, int(offset or 0))
+        q = registrar.subscribe_run(run_id)
+        yield ": connected\n\n"
+        await asyncio.sleep(0)
         try:
             while True:
                 if await request.is_disconnected():
                     break
-                # 从队列取消息（用 run_in_executor 避免阻塞 event loop）
-                msg = await loop.run_in_executor(None, _safe_get, q)
-                if msg is None:
-                    # sentinel: 任务结束
+                parts, nxt = await loop.run_in_executor(
+                    None, partial(_iter_new_log_lines, run_id, pos),
+                )
+                if nxt is None:
                     yield "event: end\ndata: {}\n\n"
                     break
-                if msg.startswith("__EVENT__:"):
-                    yield f"event: status\ndata: {msg[len('__EVENT__:'):]}\n\n"
-                else:
-                    yield f"event: log\ndata: {json.dumps({'line': msg}, ensure_ascii=False)}\n\n"
+                for part in parts:
+                    yield part
+                pos = nxt
+                if parts:
+                    await asyncio.sleep(0)
+                if not registrar.is_run_alive(run_id):
+                    extra, nxt2 = await loop.run_in_executor(
+                        None, partial(_iter_new_log_lines, run_id, pos),
+                    )
+                    if nxt2 is not None:
+                        for part in extra or []:
+                            yield part
+                        pos = nxt2
+                    yield "event: end\ndata: {}\n\n"
+                    break
+                if q is None:
+                    yield "event: end\ndata: {}\n\n"
+                    break
+                msg = await loop.run_in_executor(None, _safe_get, q)
+                if msg is None:
+                    extra, nxt2 = await loop.run_in_executor(
+                        None, partial(_iter_new_log_lines, run_id, pos),
+                    )
+                    if nxt2 is not None:
+                        for part in extra or []:
+                            yield part
+                    yield "event: end\ndata: {}\n\n"
+                    break
+                if msg == "":
+                    yield ": heartbeat\n\n"
         finally:
-            registrar.remove_run_queue(run_id)
+            registrar.unsubscribe_run(run_id, q)
 
     return StreamingResponse(
         event_gen(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, no-transform",
             "X-Accel-Buffering": "no",  # 避免 nginx 缓冲
             "Connection": "keep-alive",
         },
@@ -374,14 +437,14 @@ async def api_stream(run_id: str, request: Request):
 
 def _safe_get(q):
     try:
-        return q.get(timeout=60)
+        return q.get(timeout=2)
     except Exception:
         return ""  # 心跳：返空串让 SSE 检查 disconnect
 
 
 @app.get("/api/runs")
-def api_runs(limit: int = 50):
-    return {"ok": True, "items": db.list_runs(limit=limit)}
+def api_runs(limit: int = 50, status: str = "", kind: str = ""):
+    return {"ok": True, "items": db.list_runs(limit=limit, status=status, kind=kind)}
 
 
 @app.delete("/api/runs/{run_id}")
@@ -860,6 +923,38 @@ def api_update_credentials(req: UpdateCredReq):
     return {"ok": True, "email": email, "changed": changed}
 
 
+class ReauthReq(BaseModel):
+    emails: list[str] = Field(..., description="要重新授权的邮箱")
+    proxy: str = ""
+    otp_timeout: int = 180
+    want_access_token: bool = True
+    want_session_token: bool = True
+    want_refresh_token: bool = True
+
+
+@app.post("/api/registered/reauth")
+def api_reauth(req: ReauthReq):
+    """注册结果页重新授权：不 claim 号池，走协议登录刷新 token。"""
+    emails = [(e or "").strip().lower() for e in (req.emails or []) if (e or "").strip()]
+    if not emails:
+        raise HTTPException(400, "没有要重新授权的邮箱")
+    options = {
+        "want_access_token": req.want_access_token,
+        "want_session_token": req.want_session_token,
+        "want_refresh_token": req.want_refresh_token,
+        "proxy": req.proxy,
+        "otp_timeout": int(req.otp_timeout or 180),
+    }
+    try:
+        run_id = registrar.start_reauth(emails, options)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    logger.info(f"[reauth] {run_id} -> {emails[0]}" + (f" +{len(emails)-1} queued" if len(emails) > 1 else ""))
+    return {"ok": True, "run_id": run_id, "email": emails[0], "emails": emails}
+
+
 # ──────────────────────── Plus 试用检查 ────────────────────────
 
 
@@ -1159,12 +1254,123 @@ async def api_auto_stream(request: Request):
     )
 
 
+@app.get("/api/reauth/stream")
+async def api_reauth_stream(request: Request):
+    """SSE：重新授权排队的 run_started / run_finished / batch_done。"""
+    q = registrar.subscribe_reauth()
+
+    async def gen():
+        loop = asyncio.get_event_loop()
+        try:
+            yield ": connected\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await loop.run_in_executor(None, lambda: q.get(timeout=30))
+                except Exception:
+                    yield ": heartbeat\n\n"
+                    continue
+                if msg is None:
+                    break
+                kind = msg.get("kind", "state")
+                data = msg.get("data", {})
+                yield f"event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        finally:
+            registrar.unsubscribe_reauth(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/api/events")
+async def api_events(request: Request):
+    """auto-loop + 重新授权合流。
+
+    浏览器对同一个 host 只给 6 条 HTTP/1.1 连接，而每个标签页原本要开
+    auto / reauth / run 三条 SSE —— 开三个标签页就把连接占满，
+    连 index.html 都排不进去（实测刷新直接 60s 超时）。这里把前两条并成一条。
+
+    事件名加前缀：auto_state / auto_run_started / auto_run_finished /
+    circuit_break / reauth_state / reauth_run_started / reauth_run_finished /
+    reauth_batch_done。
+    """
+    aq = AUTO_LOOP.subscribe()
+    rq = registrar.subscribe_reauth()
+
+    def _drain(q, prefix):
+        out = []
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            if not msg:
+                continue
+            kind = msg.get("kind", "state")
+            name = kind if kind == "circuit_break" else f"{prefix}_{kind}"
+            data = msg.get("data", {})
+            out.append(f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n")
+        return out
+
+    async def gen():
+        yield ": connected\n\n"
+        try:
+            snap = AUTO_LOOP.status()
+        except Exception:  # noqa: BLE001
+            snap = {}
+        yield f"event: auto_state\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
+        last_beat = time.time()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                # 内存队列，get_nowait 不阻塞 —— 不占线程池，也不卡事件循环。
+                parts = _drain(aq, "auto") + _drain(rq, "reauth")
+                for part in parts:
+                    yield part
+                if parts:
+                    last_beat = time.time()
+                elif time.time() - last_beat > 20:
+                    yield ": heartbeat\n\n"
+                    last_beat = time.time()
+                await asyncio.sleep(0.25)
+        finally:
+            AUTO_LOOP.unsubscribe(aq)
+            registrar.unsubscribe_reauth(rq)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 # ──────────────────────── 静态资源 ────────────────────────
 
 
 @app.get("/")
 def root():
-    return FileResponse(STATIC_DIR / "index.html")
+    # hash 文件名会变，但 index.html 路径固定；不禁缓存时浏览器会一直用旧入口。
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

@@ -37,9 +37,10 @@ _lock = threading.Lock()  # SQLite 写入串行化
 
 
 def _conn() -> sqlite3.Connection:
-    con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
+    con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=5)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     return con
 
 
@@ -95,7 +96,8 @@ def init_db():
             finished_at     REAL,
             log_path        TEXT,
             error           TEXT,
-            error_category  TEXT         -- network / account / unknown
+            error_category  TEXT,        -- network / account / unknown
+            kind            TEXT         -- register / reauth
         );
     """)
     con.commit()
@@ -104,6 +106,10 @@ def init_db():
     cols = {r[1] for r in cur.fetchall()}
     if "error_category" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
+        con.commit()
+    # 后期才把注册 / 重新授权拆开；老行没有 kind，一律当 register。
+    if "kind" not in cols:
+        con.execute("ALTER TABLE runs ADD COLUMN kind TEXT")
         con.commit()
 
     # 老 DB migrate：号池多邮箱混放（kind / relay_url 在后期才加）
@@ -634,6 +640,97 @@ def save_registered(d: dict) -> None:
         con.commit()
 
 
+def save_reauth_result(d: dict) -> None:
+    """重新授权成功：覆盖 token，合并 extra_json，空密码/TOTP 不覆盖。
+
+    清掉 plus_check（旧「凭证失效」已过时）。password_on_openai 写入 extra。
+    """
+    email = (d.get("email") or "").lower()
+    if not email:
+        return
+    password = (d.get("password") or "").strip()
+    totp_secret = (d.get("totp_secret") or "").strip()
+    totp_factor_id = (d.get("totp_factor_id") or "").strip()
+    with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT password, totp_secret, totp_factor_id, extra_json, "
+            "access_token, session_token, refresh_token, id_token, "
+            "device_id, csrf_token, cookie_header FROM registered WHERE email=?",
+            (email,),
+        ).fetchone()
+        extra = {}
+        if row and row["extra_json"]:
+            try:
+                extra = json.loads(row["extra_json"]) or {}
+            except Exception:
+                extra = {}
+        if not isinstance(extra, dict):
+            extra = {}
+        extra.pop("plus_check", None)
+        extra.pop("pending", None)
+        if "password_on_openai" in d and d.get("password_on_openai") is not None:
+            extra["password_on_openai"] = bool(d.get("password_on_openai"))
+        if row:
+            if not password:
+                password = (row["password"] or "").strip()
+            if not totp_secret:
+                totp_secret = (row["totp_secret"] or "").strip()
+                totp_factor_id = totp_factor_id or (row["totp_factor_id"] or "")
+
+        def _col(key: str) -> str:
+            if key in d:
+                return d.get(key) or ""
+            if row:
+                return row[key] or ""
+            return ""
+
+        if row:
+            con.execute(
+                "UPDATE registered SET password=?, access_token=?, session_token=?, "
+                "refresh_token=?, id_token=?, device_id=?, csrf_token=?, cookie_header=?, "
+                "totp_secret=?, totp_factor_id=?, extra_json=? WHERE email=?",
+                (
+                    password,
+                    _col("access_token"),
+                    _col("session_token"),
+                    _col("refresh_token"),
+                    _col("id_token"),
+                    _col("device_id"),
+                    _col("csrf_token"),
+                    _col("cookie_header"),
+                    totp_secret,
+                    totp_factor_id,
+                    json.dumps(extra, ensure_ascii=False) if extra else None,
+                    email,
+                ),
+            )
+        else:
+            con.execute(
+                "INSERT INTO registered "
+                "(email, password, access_token, session_token, refresh_token, "
+                "id_token, device_id, csrf_token, cookie_header, "
+                "totp_secret, totp_factor_id, extra_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    email,
+                    password,
+                    d.get("access_token", ""),
+                    d.get("session_token", ""),
+                    d.get("refresh_token", ""),
+                    d.get("id_token", ""),
+                    d.get("device_id", ""),
+                    d.get("csrf_token", ""),
+                    d.get("cookie_header", ""),
+                    totp_secret,
+                    totp_factor_id,
+                    json.dumps(extra, ensure_ascii=False) if extra else None,
+                    time.time(),
+                ),
+            )
+        con.commit()
+
+
 def save_password_early(email: str, password: str) -> None:
     """密码一在 OpenAI 侧生效就落盘，不等整个注册流程跑完。
 
@@ -880,13 +977,17 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all", se
     for r in cur.fetchall():
         d = dict(r)
         plus = None
+        password_on_openai = None
         if d.get("extra_json"):
             try:
                 extra = json.loads(d["extra_json"])
                 plus = extra.get("plus_check")
+                if "password_on_openai" in extra:
+                    password_on_openai = extra.get("password_on_openai")
             except Exception:
                 pass
         d["plus_check"] = plus
+        d["password_on_openai"] = password_on_openai
         d.pop("extra_json", None)
         rows.append(d)
     return rows
@@ -896,7 +997,7 @@ def list_registered_full(limit: int = 5000) -> list[dict]:
     """返回完整凭证（用于批量导出）。每行同 get_registered 的格式，外加 relay_url。
 
     ⚠️ relay_url（中转取件链接）**不在 registered 表里**，它跟着号池那一行走
-       （outlook_accounts.relay_url，icloud_relay 这类号一号一条 token）。
+       （outlook_accounts.relay_url，icloud 这类号一号一条 token）。
        导出格式「邮箱----密码----2FA----取件url」要用它，所以这里 LEFT JOIN 带出来。
        用 JOIN 而不是给 registered 加列的原因：不用迁移、**已经注册完的老号也能导**
        （只要号池那行还在）；号池行被删掉就是空串，照约定留空、分隔符保留。
@@ -971,6 +1072,11 @@ def get_registered(email: str) -> Optional[dict]:
             out["extra"] = json.loads(out["extra_json"])
         except Exception:
             out["extra"] = {}
+    extra = out.get("extra") or {}
+    if "password_on_openai" in extra:
+        out["password_on_openai"] = extra.get("password_on_openai")
+    else:
+        out["password_on_openai"] = None
     out.pop("extra_json", None)
     return out
 
@@ -1009,13 +1115,14 @@ def delete_all_registered() -> int:
 # ──────────────────────── 运行记录 ────────────────────────
 
 
-def create_run(run_id: str, email: str, log_path: str) -> None:
+def create_run(run_id: str, email: str, log_path: str, kind: str = "register") -> None:
+    k = (kind or "register").strip() or "register"
     with _lock:
         con = _conn()
         con.execute(
-            "INSERT INTO runs(run_id, email, status, started_at, log_path) "
-            "VALUES (?, ?, 'running', ?, ?)",
-            (run_id, email.lower(), time.time(), log_path),
+            "INSERT INTO runs(run_id, email, status, started_at, log_path, kind) "
+            "VALUES (?, ?, 'running', ?, ?, ?)",
+            (run_id, email.lower(), time.time(), log_path, k),
         )
         con.commit()
 
@@ -1030,10 +1137,32 @@ def finish_run(run_id: str, status: str, error: str = "", category: str = "") ->
         con.commit()
 
 
-def list_runs(limit: int = 50) -> list[dict]:
+def get_run(run_id: str) -> Optional[dict]:
     con = _conn()
+    cur = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def list_runs(limit: int = 50, status: str = "", kind: str = "") -> list[dict]:
+    con = _conn()
+    clauses: list[str] = []
+    args: list = []
+    want = (status or "").strip()
+    kind_f = (kind or "").strip()
+    if want:
+        clauses.append("status=?")
+        args.append(want)
+    if kind_f == "reauth":
+        clauses.append("kind='reauth'")
+    elif kind_f == "register":
+        # 老行 kind 为空，一律算注册，避免误进重新授权面板
+        clauses.append("(kind IS NULL OR kind='' OR kind='register')")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    args.append(limit)
     cur = con.execute(
-        "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,),
+        f"SELECT * FROM runs {where} ORDER BY started_at DESC LIMIT ?",
+        args,
     )
     return [dict(r) for r in cur.fetchall()]
 
@@ -1152,8 +1281,8 @@ def save_mail_config(data: dict) -> None:
 
     if "mail_source" in data:
         src = str(data["mail_source"]).strip().lower()
-        get_provider_class(src)  # 未注册的 kind 会抛 MailProviderError
-        set_setting("mail_source", src)
+        cls = get_provider_class(src)  # 未注册的 kind 会抛 MailProviderError
+        set_setting("mail_source", cls.kind)
 
     # 按 provider 声明的字段保存，加新邮箱时这里零改动
     for p in list_providers():

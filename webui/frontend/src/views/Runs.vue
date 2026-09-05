@@ -104,6 +104,9 @@ onActivated(() => load())
           <template #default="{ row }"><span class="mono">{{ row.run_id }}</span></template>
         </el-table-column>
         <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
+        <el-table-column label="类型" width="100">
+          <template #default="{ row }">{{ row.kind === 'reauth' ? '重新授权' : '注册' }}</template>
+        </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <StatusDot :type="STATUS_TYPE[row.status] || 'info'" :text="row.status" />

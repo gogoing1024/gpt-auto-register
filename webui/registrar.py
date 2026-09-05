@@ -1,7 +1,7 @@
-"""注册 worker：调 auth_flow.run_register，并把日志/状态实时推到队列。
+"""注册 worker：调 auth_flow.run_register，并把日志/状态实时推到前端。
 
-每个注册任务跑在独立线程；通过 `RunLogger` 把 `logging` 记录 + tail 状态推
-到队列，前端用 SSE 实时收日志。
+每个注册任务跑在独立线程。日志文件是真相；内存队列只做「有新行」通知。
+SSE 按文件 offset tail，断开不拆生产者，F5 之后可以回放再接着订。
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]  # gpt-outlook-register/
 sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402
-from auth_flow import AuthFlow  # noqa: E402
+from auth_flow import AccountDeactivatedError, AuthFlow  # noqa: E402
 from mail_providers import (  # noqa: E402
     MailProviderError,
     create_mail_provider,
@@ -29,9 +29,13 @@ from sms_provider import PhoneCallbackController  # noqa: E402
 
 from . import db  # noqa: E402
 
-# run_id -> queue of log strings; sentinel = None 表示流结束
-_run_queues: dict[str, queue.Queue] = {}
+# 文件是真相。内存里只记「还活着」+ 每条 SSE 自己的通知队列。
+# 旧模型是一条共享 Queue + 客户端断开就 pop，F5 后再订就是 404。
+_run_alive: set[str] = set()
+_run_handlers: dict = {}
+_run_subs: dict[str, list] = {}
 _lock = threading.Lock()
+EVENT_PREFIX = "__EVENT__:"
 
 # 当前线程正在跑哪个 run。
 # ⚠️ 为什么需要这个：QueueLogHandler 是挂在 **root logger** 上的，而 root logger
@@ -49,7 +53,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class QueueLogHandler(logging.Handler):
-    """把 logging 记录扔进 run queue + 写 log 文件。
+    """把 logging 记录写进本 run 的 log 文件，并叫醒 SSE 订阅者。
 
     只收**本 run 线程**产生的日志，见 emit 里的过滤。
     """
@@ -57,11 +61,16 @@ class QueueLogHandler(logging.Handler):
     def __init__(self, run_id: str, log_file: Path):
         super().__init__()
         self.run_id = run_id
-        self._fh = open(log_file, "a", encoding="utf-8")
+        # newline="\n"：Windows 上也写 LF，offset 按字节算才稳。
+        self._fh = open(log_file, "a", encoding="utf-8", newline="\n")
         self.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%H:%M:%S",
         ))
+
+    def append_line(self, line: str) -> None:
+        self._fh.write(line + "\n")
+        self._fh.flush()
 
     def emit(self, record: logging.LogRecord):
         try:
@@ -73,12 +82,8 @@ class QueueLogHandler(logging.Handler):
             # rid is None = 不属于任何 run（webui 请求线程、启动期日志等）。
             # 这类照旧广播给所有 handler —— 宁可多收也不能丢，日志文件
             # 开头那句 "webui: [run] xxx -> email@..." 就是这么来的。
-            msg = self.format(record)
-            self._fh.write(msg + "\n")
-            self._fh.flush()
-            q = _run_queues.get(self.run_id)
-            if q is not None:
-                q.put(msg)
+            self.append_line(self.format(record))
+            _notify_run(self.run_id)
         except Exception:
             pass
 
@@ -90,15 +95,55 @@ class QueueLogHandler(logging.Handler):
         super().close()
 
 
+def _notify_run(run_id: str) -> None:
+    """叫醒所有订阅者去重新读文件。队列满就丢通知，订阅方超时也会再扫。"""
+    with _lock:
+        subs = list(_run_subs.get(run_id, []))
+    for q in subs:
+        try:
+            q.put_nowait(True)
+        except queue.Full:
+            pass
+
+
+def _mark_run_started(run_id: str) -> None:
+    with _lock:
+        _run_alive.add(run_id)
+
+
+def _register_handler(run_id: str, handler: QueueLogHandler) -> None:
+    with _lock:
+        _run_handlers[run_id] = handler
+
+
+def _finish_run_stream(run_id: str) -> None:
+    """任务线程收尾：文件已刷完。通知订阅者结束，之后只读文件。"""
+    with _lock:
+        _run_handlers.pop(run_id, None)
+        _run_alive.discard(run_id)
+        subs = _run_subs.pop(run_id, [])
+    for q in subs:
+        try:
+            q.put_nowait(None)
+        except Exception:
+            pass
+
+
 def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
-    """前端约定：以 `__EVENT__:` 开头的行被解析成 JSON 状态事件。"""
+    """写 `__EVENT__:` 行到日志文件，SSE 回放/实时都从文件解析。"""
     import json as _json
-    q = _run_queues.get(run_id)
-    if q is None:
-        return
     body = payload if isinstance(payload, dict) else {"message": str(payload)}
     body["kind"] = kind
-    q.put("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
+    line = EVENT_PREFIX + _json.dumps(body, ensure_ascii=False)
+    handler = None
+    with _lock:
+        handler = _run_handlers.get(run_id)
+    if handler is not None:
+        try:
+            handler.append_line(line)
+        except Exception:
+            pass
+    _notify_run(run_id)
 
 
 # 网络/环境层错误特征：命中任一就把号放回 available（号本身没问题，是环境炸了）
@@ -131,6 +176,7 @@ def classify_error(err: str, mail_source: str = "") -> str:
         "outlook refresh failed", "authentication failed", "authenticate failed",
         "outlook otp timeout", "registration_disallowed",
         "已有账号", "账号被", "refresh_token 失效",
+        "deleted or deactivated", "account_deactivated", "封号",
     ]
     if mail_source:
         try:
@@ -149,6 +195,31 @@ def classify_error(err: str, mail_source: str = "") -> str:
     if any(p in s for p in _NETWORK_ERROR_PATTERNS):
         return "network"
     return "unknown"
+
+
+_DEACTIVATED_MARKERS = (
+    "deleted or deactivated",
+    "account_deactivated",
+    "has been deactivated",
+)
+
+
+def _looks_deactivated(err: str) -> bool:
+    blob = (err or "").lower()
+    return any(m in blob for m in _DEACTIVATED_MARKERS)
+
+
+def _mark_registered_banned(email: str, reason: str = "") -> None:
+    """注册结果表标成封号，和 Plus 检测的 banned 同一套字段。"""
+    em = (email or "").strip().lower()
+    if not em:
+        return
+    db.update_plus_check(em, {
+        "status": "banned",
+        "label": "封号",
+        "checked_at": time.time(),
+        "reason": (reason or "")[:240],
+    })
 
 
 def _do_register(
@@ -173,6 +244,7 @@ def _do_register(
 
     handler = QueueLogHandler(run_id, log_file)
     handler.setLevel(logging.INFO)
+    _register_handler(run_id, handler)
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
     # 第一次需要的话提到 INFO 级别
@@ -325,6 +397,11 @@ def _do_register(
             "email": full.get("email", ""),
             "password": full.get("password", ""),
         }
+        if full.get("password_on_openai") is not None:
+            d["password_on_openai"] = full.get("password_on_openai")
+        if full.get("password_on_openai") is False:
+            # 探测到无密：不要把库内残留字符串回读后当成「本轮密码」展示
+            d["password"] = ""
         if options.get("want_access_token", True):
             d["access_token"] = full.get("access_token", "")
         if options.get("want_session_token", True):
@@ -344,7 +421,7 @@ def _do_register(
         #       连同两个复制按钮一起藏掉，主人会以为密码丢了。
         #    以前这段在 2FA **之后**，于是老号在 2FA 眼里永远"无密码"→ 被跳过。
         #    只在 d 里密码为空时查一次，正常路径零额外开销。
-        if not (d.get("password") or "").strip():
+        if not (d.get("password") or "").strip() and d.get("password_on_openai") is not False:
             try:
                 _saved = db.get_registered(d.get("email") or "")
                 _pw = ((_saved or {}).get("password") or "").strip()
@@ -445,6 +522,9 @@ def _do_register(
     except Exception as e:
         err = str(e)
         category = classify_error(err, mail_source)
+        if isinstance(e, AccountDeactivatedError) or _looks_deactivated(err):
+            category = "account"
+            _mark_registered_banned(email, err)
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
         # ⚠️ 密码是在 register_password 里现生成的，只活在内存里。
         #    走到这里说明 save_registered 没执行过 —— 但 POST user/register 可能**已经成功**，
@@ -481,9 +561,7 @@ def _do_register(
             handler.close()
         except Exception:
             pass
-        q = _run_queues.get(run_id)
-        if q is not None:
-            q.put(None)  # sentinel: 流结束
+        _finish_run_stream(run_id)
         # 线程标记清掉。理论上线程跑完就回收了，但 threading.local 是绑在
         # 线程对象上的，万一以后换成线程池复用线程，残留的 run_id 会让下一个
         # 任务的日志全被投递到上一个 run 的（已关闭的）文件里去。
@@ -609,11 +687,8 @@ def start_registration(account: dict, options: dict) -> str:
     """启动一次注册任务，返回 run_id。"""
     run_id = uuid.uuid4().hex[:12]
     log_file = LOG_DIR / f"{run_id}.log"
-    db.create_run(run_id, account["email"], str(log_file))
-
-    q: queue.Queue = queue.Queue()
-    with _lock:
-        _run_queues[run_id] = q
+    db.create_run(run_id, account["email"], str(log_file), kind="register")
+    _mark_run_started(run_id)
 
     th = threading.Thread(
         target=_do_register,
@@ -625,10 +700,392 @@ def start_registration(account: dict, options: dict) -> str:
     return run_id
 
 
-def get_run_queue(run_id: str) -> Optional[queue.Queue]:
-    return _run_queues.get(run_id)
+# 重新授权：同一邮箱同时只能跑一个，避免两封 OTP 互踩。
+# 批量排队靠 run_started / run_finished / batch_done 推给前端，和 auto-loop 一样。
+# state 快照给弹窗进度条：整批没结束前不能显示「重新授权完成」。
+_reauth_locks: set[str] = set()
+_reauth_subs: list[queue.Queue] = []
+_reauth_sub_lock = threading.Lock()
+_reauth_batch_lock = threading.Lock()
+_reauth_batch: dict = {
+    "active": False,
+    "total": 0,
+    "ok": 0,
+    "fail": 0,
+    "current": "",
+}
 
 
-def remove_run_queue(run_id: str) -> None:
+def get_reauth_snapshot() -> dict:
+    with _reauth_batch_lock:
+        return dict(_reauth_batch)
+
+
+def _note_reauth_progress(
+    *,
+    start: int | None = None,
+    current: str | None = None,
+    finished_ok: bool | None = None,
+    done: bool = False,
+) -> dict:
+    with _reauth_batch_lock:
+        if start is not None:
+            _reauth_batch.update(
+                active=True,
+                total=int(start),
+                ok=0,
+                fail=0,
+                current="",
+            )
+        if current is not None:
+            _reauth_batch["current"] = current
+        if finished_ok is True:
+            _reauth_batch["ok"] = int(_reauth_batch.get("ok") or 0) + 1
+            _reauth_batch["current"] = ""
+        elif finished_ok is False:
+            _reauth_batch["fail"] = int(_reauth_batch.get("fail") or 0) + 1
+            _reauth_batch["current"] = ""
+        if done:
+            _reauth_batch["active"] = False
+            _reauth_batch["current"] = ""
+        snap = dict(_reauth_batch)
+    _broadcast_reauth("state", snap)
+    return snap
+
+
+def subscribe_reauth() -> queue.Queue:
+    q: queue.Queue = queue.Queue(maxsize=100)
+    with _reauth_sub_lock:
+        _reauth_subs.append(q)
+    try:
+        q.put_nowait({"kind": "state", "data": get_reauth_snapshot()})
+    except queue.Full:
+        pass
+    return q
+
+
+def unsubscribe_reauth(q: queue.Queue) -> None:
+    with _reauth_sub_lock:
+        try:
+            _reauth_subs.remove(q)
+        except ValueError:
+            pass
+
+
+def _broadcast_reauth(kind: str, data: dict) -> None:
+    with _reauth_sub_lock:
+        subs = list(_reauth_subs)
+    for q in subs:
+        try:
+            q.put_nowait({"kind": kind, "data": data})
+        except queue.Full:
+            pass
+
+
+def _wait_run_finish(run_id: str, timeout: int = 1800) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = db.get_run(run_id)
+        if not row or (row.get("status") or "") != "running":
+            return
+        time.sleep(0.4)
+
+
+def _start_reauth_one(email: str, options: dict) -> str:
+    """一个邮箱一条 run / 一份日志，和全自动每个号一个 register run 一样。"""
     with _lock:
-        _run_queues.pop(run_id, None)
+        if email in _reauth_locks:
+            raise RuntimeError("正在重新授权，请稍后再试: " + email)
+        _reauth_locks.add(email)
+    try:
+        run_id = uuid.uuid4().hex[:12]
+        log_file = LOG_DIR / f"{run_id}.log"
+        db.create_run(run_id, email, str(log_file), kind="reauth")
+        _mark_run_started(run_id)
+        threading.Thread(
+            target=_do_reauth,
+            args=(run_id, email, options, log_file),
+            daemon=True,
+            name=f"reauth-{run_id}",
+        ).start()
+        _note_reauth_progress(current=email)
+        _broadcast_reauth("run_started", {"email": email, "run_id": run_id})
+        return run_id
+    except Exception:
+        with _lock:
+            _reauth_locks.discard(email)
+        raise
+
+
+def start_reauth(emails: list[str], options: dict) -> str:
+    """启动重新授权（不 claim 号池）。每个邮箱一个 run；多个则顺序排队。"""
+    cleaned = []
+    seen = set()
+    for raw in emails or []:
+        em = (raw or "").strip().lower()
+        if not em or em in seen:
+            continue
+        seen.add(em)
+        cleaned.append(em)
+    if not cleaned:
+        raise ValueError("没有要重新授权的邮箱")
+
+    n = len(cleaned)
+    with _reauth_batch_lock:
+        if _reauth_batch.get("active"):
+            raise RuntimeError("已有重新授权队列在跑")
+        _reauth_batch.update(active=True, total=n, ok=0, fail=0, current="")
+    _broadcast_reauth("state", get_reauth_snapshot())
+    try:
+        first_id = _start_reauth_one(cleaned[0], options)
+    except Exception:
+        with _reauth_batch_lock:
+            _reauth_batch.update(active=False, total=0, ok=0, fail=0, current="")
+        _broadcast_reauth("state", get_reauth_snapshot())
+        raise
+
+    def _rest() -> None:
+        try:
+            _wait_run_finish(first_id)
+            for email in cleaned[1:]:
+                try:
+                    rid = _start_reauth_one(email, options)
+                except Exception as e:
+                    logging.getLogger("registrar").exception(f"[reauth] 启动失败: {email}")
+                    _note_reauth_progress(finished_ok=False)
+                    _broadcast_reauth("run_finished", {
+                        "email": email, "run_id": "", "ok": False, "error": str(e),
+                    })
+                    continue
+                _wait_run_finish(rid)
+        except Exception:
+            logging.getLogger("registrar").exception("[reauth] 批量排队异常")
+        finally:
+            snap = _note_reauth_progress(done=True)
+            _broadcast_reauth("batch_done", {
+                "n": snap.get("total") or n,
+                "ok": snap.get("ok") or 0,
+                "fail": snap.get("fail") or 0,
+            })
+
+    threading.Thread(target=_rest, daemon=True, name="reauth-batch").start()
+    return first_id
+
+
+def _do_reauth(run_id: str, email: str, options: dict, log_file: Path) -> None:
+    _current_run.run_id = run_id
+    handler = QueueLogHandler(run_id, log_file)
+    handler.setLevel(logging.INFO)
+    _register_handler(run_id, handler)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    if root_logger.level > logging.INFO or root_logger.level == 0:
+        root_logger.setLevel(logging.INFO)
+
+    log = logging.getLogger("registrar")
+    ok = False
+
+    try:
+        _emit_status(run_id, "phase", {"phase": "reauth", "email": email})
+        log.info(f"[reauth] 开始: {email}")
+        _reauth_one(run_id, email, options)
+        log.info(f"[reauth] 完成: {email}")
+        db.finish_run(run_id, "done")
+        _emit_status(run_id, "done", {
+            "email": email,
+            "password": "",
+            "totp_secret": "",
+            "access_token_len": 0,
+            "partial": False,
+            "reauth": True,
+            "ok": 1,
+            "fail": 0,
+        })
+        ok = True
+    except Exception as e:
+        err = str(e)
+        # 兜底认字符串：密码页、无密码 OTP、TOTP 都可能返回同一个 403，
+        # 漏掉哪条分支都会让封号号显示成普通失败。
+        if isinstance(e, AccountDeactivatedError) or _looks_deactivated(err):
+            log.error(f"[reauth] 封号 {email}: {err}")
+            _mark_registered_banned(email, err)
+            db.finish_run(run_id, "failed", err, category="account")
+        else:
+            log.error(f"[reauth] 失败 {email}: {err}")
+            log.error(traceback.format_exc())
+            db.finish_run(run_id, "failed", err, category="unknown")
+        _emit_status(run_id, "error", {"message": err, "email": email})
+    finally:
+        with _lock:
+            _reauth_locks.discard(email)
+        try:
+            root_logger.removeHandler(handler)
+            handler.close()
+        except Exception:
+            pass
+        _finish_run_stream(run_id)
+        _note_reauth_progress(finished_ok=bool(ok))
+        _broadcast_reauth("run_finished", {"email": email, "run_id": run_id, "ok": ok})
+        try:
+            del _current_run.run_id
+        except Exception:
+            pass
+
+
+def _reauth_one(run_id: str, email: str, options: dict) -> None:
+    account = db.get_account(email)
+    if not account:
+        raise RuntimeError("号池里没有该邮箱的接码信息，无法收 OTP")
+
+    kind = (account.get("kind") or "").strip() or db.get_setting("mail_source", "outlook")
+    mail = create_mail_provider(kind, db.get_mail_settings(), account)
+    log = logging.getLogger("registrar")
+    log.info(f"[reauth] 邮箱来源: {kind} ({mail.display_name})")
+
+    env_overrides = {
+        "WEBUI_ALLOW_LOGIN": "1",
+        "OTP_TIMEOUT": str(int(options.get("otp_timeout") or 180)),
+    }
+    if not options.get("want_refresh_token", True):
+        env_overrides["SKIP_OAUTH_TOKEN_EXCHANGE"] = "1"
+        env_overrides["OAUTH_CODEX_RT_EXCHANGE"] = "0"
+        env_overrides["OAUTH_CODEX_RT_BEFORE_CALLBACK"] = "0"
+
+    cfg = Config()
+    cfg.proxy = (options.get("proxy") or "").strip() or None
+
+    def _account_callback_for_flow(em: str) -> dict:
+        try:
+            data = db.get_registered(em)
+            if data:
+                return {
+                    "password": data.get("password", ""),
+                    "totp_secret": data.get("totp_secret", ""),
+                }
+        except Exception as e:
+            log.warning(f"[reauth] account_callback 异常: {e}")
+        return {}
+
+    flow = AuthFlow(
+        cfg,
+        sms_callback=_build_sms_callback(run_id),
+        env_overrides=env_overrides,
+        account_callback=_account_callback_for_flow,
+    )
+    saved = db.get_registered(email) or {}
+    if saved.get("totp_secret"):
+        flow.result.totp_secret = saved.get("totp_secret") or ""
+
+    result = flow.run_protocol_login(mail, email)
+    d = result.to_dict()
+    d["email"] = (d.get("email") or email).lower()
+    if not options.get("want_access_token", True):
+        d.pop("access_token", None)
+    if not options.get("want_session_token", True):
+        d.pop("session_token", None)
+        d.pop("cookie_header", None)
+    if not options.get("want_refresh_token", True):
+        d.pop("refresh_token", None)
+        d.pop("id_token", None)
+    # 无密探测成功时不要把库内残留密码写进 result 再落库成「本轮密码」
+    if d.get("password_on_openai") is False:
+        d["password"] = ""
+    db.save_reauth_result(d)
+    log.info(
+        f"[reauth] 已更新凭证 email={d.get('email')} "
+        f"pw_on_openai={d.get('password_on_openai')} "
+        f"at={len(d.get('access_token') or '')} "
+        f"st={len(d.get('session_token') or '')} "
+        f"rt={len(d.get('refresh_token') or '')}"
+    )
+
+
+def is_run_alive(run_id: str) -> bool:
+    with _lock:
+        return run_id in _run_alive
+
+
+def subscribe_run(run_id: str) -> Optional[queue.Queue]:
+    """给一条 SSE 连接自己的通知队列。run 已结束则返回 None（调用方只读文件）。"""
+    with _lock:
+        if run_id not in _run_alive:
+            return None
+        q: queue.Queue = queue.Queue(maxsize=32)
+        _run_subs.setdefault(run_id, []).append(q)
+        return q
+
+
+def unsubscribe_run(run_id: str, q: Optional[queue.Queue]) -> None:
+    if q is None:
+        return
+    with _lock:
+        subs = _run_subs.get(run_id)
+        if not subs:
+            return
+        try:
+            subs.remove(q)
+        except ValueError:
+            pass
+
+
+def _safe_log_path(run_id: str, log_path: str = "") -> Optional[Path]:
+    root = LOG_DIR.resolve()
+    raw = Path(log_path) if log_path else (LOG_DIR / f"{run_id}.log")
+    try:
+        path = raw.resolve()
+    except Exception:
+        return None
+    if path.parent != root:
+        return None
+    return path
+
+
+def split_complete_lines(data: bytes, offset: int = 0) -> tuple[list[str], int]:
+    """从 offset 起切出以 \\n 结尾的完整行，返回 (行, 下一字节偏移)。
+
+    兼容 LF / CRLF。最后半行不算，offset 停在它开头，下次还能接上。
+    """
+    if offset < 0:
+        offset = 0
+    if offset > len(data):
+        offset = len(data)
+    pos = offset
+    lines: list[str] = []
+    while True:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            break
+        line_b = data[pos:nl]
+        if line_b.endswith(b"\r"):
+            line_b = line_b[:-1]
+        lines.append(line_b.decode("utf-8", errors="replace"))
+        pos = nl + 1
+    return lines, pos
+
+
+def read_run_log(run_id: str, offset: int = 0, tail: int = 0) -> Optional[dict]:
+    """读某个 run 的日志文件。run 不存在返回 None。"""
+    row = db.get_run(run_id)
+    if not row:
+        return None
+    path = _safe_log_path(run_id, row.get("log_path") or "")
+    raw = b""
+    if path is not None and path.is_file():
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            raw = b""
+    start = 0 if tail else max(0, int(offset or 0))
+    lines, next_offset = split_complete_lines(raw, start)
+    if tail and len(lines) > tail:
+        lines = lines[-tail:]
+    with _lock:
+        alive = run_id in _run_alive
+    return {
+        "run_id": run_id,
+        "email": row.get("email") or "",
+        "status": row.get("status") or "",
+        "lines": lines,
+        "next_offset": next_offset,
+        "alive": alive,
+    }

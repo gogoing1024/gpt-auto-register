@@ -25,6 +25,8 @@ const defaults = {
   // 上一轮全量检测收工的时间（ms 时间戳，0 = 还没收过轮）。
   // 收工后要满 6 小时才自动开下一轮；放这里是为了刷新页面也不会把冷却清掉。
   autoCheckRoundDoneAt: 0,
+  // 实时日志：默认不跟滚，勾上才贴底（单次 / 全自动 / 重新授权共用）。
+  logAutoScroll: false,
 }
 
 // el-select 的 clearable 清空时把值写成 **undefined**（不是 ''），而 proxy 在三个

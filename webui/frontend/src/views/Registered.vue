@@ -6,12 +6,14 @@ import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
   listExportFormats, exportRegistered, updateCredentials,
+  startReauth,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
 import StatusDot from '@/components/StatusDot.vue'
+import LogPanel from '@/components/LogPanel.vue'
 
 const { form } = storeToRefs(useFormStore())
 // 检测用的代理必须能从代理池里挑：以前这页只在代码里读 form.proxy，页面上
@@ -21,7 +23,29 @@ const { list: proxyList } = storeToRefs(useProxyStore())
 const runtime = useRuntimeStore()
 // dataVersion 要走 storeToRefs 才保持响应（watch 用）；bumpData 是 action，直接从
 // store 实例上取 —— storeToRefs 只转 state/getter，把 action 解构出来会丢 this。
-const { dataVersion } = storeToRefs(runtime)
+const { runningReauth, lastReauthResult, reauthBatch, dataVersion, reauthRestoreOpen } = storeToRefs(runtime)
+
+const reauthAlert = computed(() => {
+  const b = reauthBatch.value || {}
+  const finished = (b.ok || 0) + (b.fail || 0)
+  const idx = Math.min(finished + (b.current ? 1 : 0), b.total || 0)
+  if (!b.done) {
+    return {
+      type: 'info',
+      title: `重新授权进行中 ${idx}/${b.total}`,
+      desc: `成功 ${b.ok || 0}`
+        + (b.fail ? ` / 失败 ${b.fail}` : '')
+        + (b.current ? ` · 当前 ${b.current}` : ''),
+    }
+  }
+  if (b.fail && b.ok) {
+    return { type: 'warning', title: '重新授权部分完成', desc: `成功 ${b.ok} / 失败 ${b.fail}` }
+  }
+  if (b.fail) {
+    return { type: 'error', title: '重新授权失败', desc: `失败 ${b.fail}` + (b.ok ? ` / 成功 ${b.ok}` : '') }
+  }
+  return { type: 'success', title: '重新授权完成', desc: `成功 ${b.ok || 0}` }
+})
 
 const PAGE_SIZE_OPTIONS = [50, 100, 500, 1000]
 const pageSize = ref(50)
@@ -49,6 +73,10 @@ const PLUS_TYPE = {
   banned: 'danger', error: 'danger',
 }
 function plusOf(row) { return row.plus_check || null }
+
+function showOpenAiPassword(row) {
+  return row.password_on_openai !== false && !!(row.password || '').trim()
+}
 
 // 自动检测：按库里的顺序全量查 Plus，已检测的也再跑一遍。
 // 游标写进 form（localStorage）：刷新后按上次最后一个号接着扫，不要从头来。
@@ -142,9 +170,11 @@ function isAutoSkipped(email) {
   return true
 }
 
-async function load(resetPage) {
+async function load(resetPage, opts = {}) {
   if (resetPage) page.value = 1
-  loading.value = true
+  // 自动检测 / 后台 bump 会反复拉表。已有行时不要整表转圈，否则 F5 后看起来像卡死。
+  const silent = !!opts.silent && rows.value.length
+  if (!silent) loading.value = true
   try {
     const { items, total: t, search } = await listRegistered({
       limit: pageSize.value, offset: (page.value - 1) * pageSize.value, filter: filter.value,
@@ -319,7 +349,7 @@ async function autoTick() {
       // 收轮那一批游标已经回 0，进度不能显示成 0/total
       const pos = wrapped ? total : autoOffset
       r = await runCheck(emails, total ? `全量检测中 ${pos}/${total}` : '全量检测中')
-      await load()
+      await load(false, { silent: true })
     }
     if (!form.value.autoCheckPlus) return
     if (wrapped) {
@@ -353,6 +383,65 @@ async function confirm(msg) {
   }
   catch (_) { return false }
 }
+const reauthVisible = ref(false)
+const reauthTitle = ref('重新授权')
+
+function openReauthDialog(title) {
+  if (title) reauthTitle.value = title
+  else if (!reauthTitle.value) reauthTitle.value = '重新授权'
+  reauthVisible.value = true
+  runtime.ackReauthRestore()
+}
+
+async function startReauthEmails(emails) {
+  const list = [...new Set((emails || []).map((e) => String(e || '').trim().toLowerCase()).filter(Boolean))]
+  if (!list.length) { ElMessage.info('没有要重新授权的号'); return }
+  if (runningReauth.value) { ElMessage.warning('已有重新授权任务在跑，等当前日志结束后再点'); return }
+  reauthTitle.value = list.length === 1 ? `重新授权 · ${list[0]}` : `重新授权 · ${list.length} 个号`
+  runtime.clearReauthLogs()
+  lastReauthResult.value = null
+  reauthVisible.value = true
+  runtime.beginReauthBatch(list.length, list[0])
+  try {
+    const r = await startReauth({
+      emails: list,
+      proxy: proxyText(form.value),
+      otp_timeout: parseInt(form.value.otpTimeout, 10) || 180,
+      want_access_token: true,
+      want_session_token: true,
+      want_refresh_token: true,
+    })
+    runtime.addLog(`[reauth] 已排队 ${list.length} 个号，先跑 ${r.email || list[0]} (run=${r.run_id})`, 'evt', 'reauth')
+    if (r.email || list[0]) {
+      reauthBatch.value = { ...reauthBatch.value, current: r.email || list[0] }
+    }
+    if (r.run_id) runtime.streamRun(r.run_id, 0, { channel: 'reauth' })
+  } catch (e) {
+    ElMessage.error(e.message)
+    lastReauthResult.value = { error: e.message }
+    runtime.addLog(`错误: ${e.message}`, 'err', 'reauth')
+    runtime.abortReauthBatch()
+  }
+}
+
+async function reauthOne(email) {
+  if (!(await confirm(`重新授权 ${email}？\n会走 OpenAI 登录（密码页或邮箱验证码，如有 2FA 再过 TOTP）刷新凭证。号池状态不变。`))) return
+  await startReauthEmails([email])
+}
+
+async function reauthSelected() {
+  const emails = selected.value.map((r) => r.email)
+  if (!emails.length) { ElMessage.info('请先勾选要重新授权的号'); return }
+  if (!(await confirm(`重新授权选中的 ${emails.length} 个号？按顺序执行，号池状态不变。`))) return
+  await startReauthEmails(emails)
+}
+
+function onRowMore(cmd, row) {
+  if (cmd === 'reauth') reauthOne(row.email)
+  else if (cmd === 'edit') openEdit(row)
+  else if (cmd === 'delete') deleteOne(row.email)
+}
+
 async function deleteOne(email) {
   if (!(await confirm(`删除 ${email} 的凭证？`))) return
   try { await deleteRegistered(email); ElMessage.success('已删除'); load() }
@@ -526,7 +615,10 @@ const INLINE_MAX = 80
 const credRows = computed(() => {
   if (!credData.value) return []
   return CRED_META
-    .filter(([k]) => credData.value[k])
+    .filter(([k]) => {
+      if (k === 'password' && credData.value.password_on_openai === false) return false
+      return credData.value[k]
+    })
     .map(([k, label]) => {
       const val = String(credData.value[k])
       return { key: k, label, val, short: val.length <= INLINE_MAX, critical: k === 'totp_secret' }
@@ -613,7 +705,7 @@ async function saveEdit() {
 watch(page, () => load())
 watch(pageSize, () => load(true))
 watch(dataVersion, () => {
-  load()
+  load(false, { silent: true })
   if (form.value.autoCheckPlus) scheduleAutoCheck(600)
 })
 watch(() => form.value.autoCheckPlus, (on) => {
@@ -628,9 +720,28 @@ watch(() => form.value.autoCheckPlus, (on) => {
     autoTimer = 0
   }
 })
-onActivated(() => {
-  load()
-  if (form.value.autoCheckPlus) scheduleAutoCheck(400)
+onActivated(async () => {
+  await load()
+  // 表先出来。自动检测会打 chatgpt.com（抓包一批 5–16s），不要和首屏抢转圈。
+  if (form.value.autoCheckPlus) scheduleAutoCheck(2000)
+  if (reauthRestoreOpen.value || runningReauth.value) {
+    const n = reauthBatch.value?.total || 0
+    const email = reauthBatch.value?.current || lastReauthResult.value?.email
+    openReauthDialog(
+      n > 1 ? `重新授权 · ${n} 个号`
+        : email ? `重新授权 · ${email}` : '重新授权',
+    )
+  }
+})
+watch(reauthRestoreOpen, (v) => {
+  if (v) {
+    const n = reauthBatch.value?.total || 0
+    const email = reauthBatch.value?.current || lastReauthResult.value?.email
+    openReauthDialog(
+      n > 1 ? `重新授权 · ${n} 个号`
+        : email ? `重新授权 · ${email}` : '重新授权',
+    )
+  }
 })
 onUnmounted(() => {
   if (autoTimer) clearTimeout(autoTimer)
@@ -689,6 +800,14 @@ onUnmounted(() => {
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
           检测选中 ({{ selected.length }})
         </el-button>
+        <el-button
+          type="primary" plain
+          :loading="runningReauth"
+          :disabled="!selected.length"
+          @click="reauthSelected"
+        >
+          重新授权选中 ({{ selected.length }})
+        </el-button>
         <el-switch v-model="form.autoCheckPlus" active-text="自动检测" />
       </el-space>
 
@@ -731,11 +850,12 @@ onUnmounted(() => {
         <el-table-column label="密码" min-width="170">
           <template #default="{ row }">
             <el-button
-              v-if="row.password" size="small" text type="primary"
+              v-if="showOpenAiPassword(row)" size="small" text type="primary"
               class="cell-copy mono" @click="copyText(row.password)"
             >
               {{ row.password }}<el-icon class="ico"><CopyDocument /></el-icon>
             </el-button>
+            <span v-else-if="row.password_on_openai === false" class="hint">未在 OpenAI 设密</span>
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
@@ -787,15 +907,20 @@ onUnmounted(() => {
         <el-table-column label="时间" width="160">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right" class-name="col-ops">
+        <el-table-column label="操作" width="200" fixed="right" class-name="col-ops">
           <template #default="{ row }">
-            <!-- flex + 取消相邻按钮默认 margin-left，否则「删除」会折到第二行、把行高撑开。
-                 三颗按钮实测 132px（96px 文字 + 6px×2 内边距），配合下面收窄的 cell padding
-                 刚好放进 160，再宽就是一片空白。nowrap 下放不下会裁字，别再往下调。 -->
             <div class="row-ops">
               <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
-              <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+              <el-dropdown trigger="click" @command="(cmd) => onRowMore(cmd, row)">
+                <el-button size="small" text>更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="reauth" :disabled="runningReauth">重新授权</el-dropdown-item>
+                    <el-dropdown-item command="edit">编辑</el-dropdown-item>
+                    <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </div>
           </template>
         </el-table-column>
@@ -857,6 +982,12 @@ onUnmounted(() => {
         <!-- 限高 + 内部滚动：字段多的号（7 个以上）弹窗会顶出视口，
              底部的字段直接被裁掉，而 el-dialog 默认不给 body 滚动条。 -->
         <div class="cred-body">
+          <el-alert
+            v-if="credData && credData.password_on_openai === false"
+            type="info" :closable="false" show-icon style="margin-bottom: 12px"
+            title="未在 OpenAI 设密"
+            description="登录走邮箱验证码，不走密码页。库里若有旧字符串不会当登录密码展示。"
+          />
           <div v-for="r in credRows" :key="r.key" class="cred-row">
             <div class="cred-row-head">
               <span class="mono cred-key" :class="{ critical: r.critical }">{{ r.key }}</span>
@@ -878,7 +1009,7 @@ onUnmounted(() => {
         <el-alert
           type="warning" :closable="false" show-icon style="margin-bottom: 16px"
           title="仅修改本地记录，不会同步到 OpenAI"
-          description="这里改密码不等于改了账号密码。填入的值会被登录流程直接使用。"
+          description="这里改密码不等于改了账号密码。列表只显示 OpenAI 确认过的密码（重新授权探测到 /log-in/password 且校验成功）。留空表示该号无密码。"
         />
         <el-form label-position="top">
           <el-form-item label="邮箱">
@@ -900,6 +1031,26 @@ onUnmounted(() => {
         <template #footer>
           <el-button @click="editVisible = false">取消</el-button>
           <el-button type="primary" :loading="editSaving" @click="saveEdit">保存</el-button>
+        </template>
+      </el-dialog>
+
+      <el-dialog v-model="reauthVisible" :title="reauthTitle" width="760px" top="6vh" append-to-body>
+        <LogPanel source="reauth" />
+        <el-alert
+          v-if="lastReauthResult && lastReauthResult.error && !reauthBatch.total"
+          type="error" :closable="false" style="margin-top: 12px"
+          :title="lastReauthResult.error"
+        />
+        <el-alert
+          v-else-if="reauthBatch.total"
+          :type="reauthAlert.type"
+          :closable="false"
+          style="margin-top: 12px"
+          :title="reauthAlert.title"
+          :description="reauthAlert.desc"
+        />
+        <template #footer>
+          <el-button @click="reauthVisible = false">{{ runningReauth ? '后台继续' : '关闭' }}</el-button>
         </template>
       </el-dialog>
     </el-card>

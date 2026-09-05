@@ -40,7 +40,7 @@ from .base import (  # noqa: F401
 
 from . import outlook        # noqa: F401,E402  kind="outlook"
 from . import cf_temp        # noqa: F401,E402  kind="cf_temp"
-from . import icloud_relay   # noqa: F401,E402  kind="icloud_relay"
+from . import icloud         # noqa: F401,E402  kind="icloud"
 from . import atomicmail     # noqa: F401,E402  kind="atomicmail"
 
 __all__ = [

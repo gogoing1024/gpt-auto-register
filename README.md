@@ -131,7 +131,7 @@ WebUI 提供：
 | `mail_providers/base.py` | ~550 | 邮箱 provider 统一基类 + 共用 OTP 抽取（HTML span 优先，排除邮箱/时间戳/hex 颜色） |
 | `mail_providers/outlook.py` | ~650 | Outlook 接码池（Graph API + IMAP XOAUTH2 双通道，refresh_token 续期 + 多 folder + tm1 影子过滤） |
 | `mail_providers/cf_temp.py` | ~400 | CF Worker 自建 catch-all（`cloudflare_temp_email` 兼容），每次新地址 |
-| `mail_providers/icloud_relay.py` | ~310 | iCloud 隐藏邮件（Hide My Email）中转 |
+| `mail_providers/icloud.py` | ~310 | iCloud 隐藏邮件（Hide My Email）中转 |
 | `sentinel.py` | ~290 | OpenAI Sentinel Token 纯 Python PoW（FNV-1a 32-bit） |
 | `sentinel_quickjs.py` | ~270 | Sentinel Token QuickJS 路径（跑 OpenAI sdk.js，需要 node） |
 | `openai_sentinel_quickjs.js` | ~400 | QuickJS 路径用的 sdk.js wrapper |

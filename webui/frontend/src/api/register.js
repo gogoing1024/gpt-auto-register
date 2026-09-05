@@ -4,7 +4,10 @@ import http from './request'
 export const startRegister = (payload) => http.post('/api/register', payload)
 
 // ──────────────── 运行记录 ────────────────
-export const listRuns = (limit = 50) => http.get('/api/runs', { params: { limit } })
+export const listRuns = (limit = 50, params = {}) =>
+  http.get('/api/runs', { params: { limit, ...params } })
+export const getRunLogs = (runId, params = {}) =>
+  http.get(`/api/runs/${encodeURIComponent(runId)}/logs`, { params })
 export const deleteRun = (runId) => http.delete(`/api/runs/${encodeURIComponent(runId)}`)
 export const bulkDeleteRuns = (payload) =>
   http.post('/api/runs/bulk_delete', payload) // { run_ids } 或 { all: true }
@@ -38,6 +41,8 @@ export const exportRegistered = (payload) => http.post('/api/registered/export',
 
 export const checkPlus = (emails, proxy = '', opts = {}) =>
   http.post('/api/registered/check_plus', { emails, proxy }, opts)
+
+export const startReauth = (payload) => http.post('/api/registered/reauth', payload)
 
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })

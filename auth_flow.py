@@ -50,6 +50,64 @@ def _totp_now(secret_b32: str) -> str:
     return _hotp(secret_b32, int(time.time()) // 30)
 
 
+class AccountDeactivatedError(RuntimeError):
+    """OpenAI 明确说这个号已删除/停用。再发 OTP 没有意义。"""
+
+
+_DEACTIVATED_MARKERS = (
+    "deleted or deactivated",
+    "has been deleted",
+    "has been deactivated",
+    "account_deactivated",
+    "accountdeactivated",
+    "you do not have an account because",
+)
+
+
+def _looks_account_deactivated(text: str) -> bool:
+    blob = (text or "").lower()
+    return any(m in blob for m in _DEACTIVATED_MARKERS)
+
+
+def _err_summary(body: str, limit: int = 400) -> str:
+    """把 OpenAI 的错误 JSON 压成一行。
+
+    直接截断原始 body 会把 message 切在半截（日志里只剩 `"param": null,`），
+    真正有用的那句话反而看不到。这里优先取 error.message + code。
+    """
+    raw = (body or "").strip()
+    if not raw:
+        return "(空响应)"
+    try:
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return " ".join(raw.split())[:limit]
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "").strip()
+            code = str(err.get("code") or err.get("type") or "").strip()
+            if msg:
+                return f"{msg} [{code}]" if code else msg
+        for key in ("message", "detail", "error_description"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:limit]
+    return " ".join(raw.split())[:limit]
+
+
+def _raise_auth_error(label: str, status: int, body: str) -> None:
+    """非 200 统一抛错。
+
+    OpenAI 明说号已删除/停用时抛 AccountDeactivatedError —— 密码页和无密码 OTP
+    两条分支都会碰到这个 403，调用方据此直接标封号，不要再当普通失败重试。
+    """
+    detail = _err_summary(body)
+    if _looks_account_deactivated(body):
+        raise AccountDeactivatedError(f"账号已删除或停用（封号）: {status} - {detail}")
+    raise RuntimeError(f"{label}: {status} - {detail}")
+
+
 class AuthResult:
     """认证结果"""
 
@@ -64,6 +122,8 @@ class AuthResult:
         self.refresh_token: str = ""
         self.cookie_header: str = ""
         self.totp_secret: str = ""
+        # OpenAI 侧是否真的设了登录密码。None = 本轮没探测到，别把库内残留字符串当真。
+        self.password_on_openai: Optional[bool] = None
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -80,6 +140,7 @@ class AuthResult:
             "refresh_token": self.refresh_token,
             "cookie_header": self.cookie_header,
             "totp_secret": self.totp_secret,
+            "password_on_openai": self.password_on_openai,
         }
 
 
@@ -890,94 +951,17 @@ class AuthFlow:
         """
         当 Codex 授权回落到 /log-in 时，补走一次纯协议登录推进状态机。
         返回可继续跟随的 continue_url（若无则返回空字符串）。
+        先看 page_type，禁止一上来把库内密码写入 result.password。
         """
         email = (self.result.email or "").strip()
         if not email:
             logger.warning("Codex 登录推进缺少 email")
             return ""
-        password, pw_is_real = self._resolve_login_password(email)
-        if pw_is_real:
-            self.result.password = password
-        else:
-            # 猜的密码只拿去碰一下 401，不落进 result（否则会被当成真密码存库/打日志）
-            logger.info("Codex 登录推进：该号无已知密码，用默认规则猜一个试试（多半 401）")
-
-        device_id = (self.result.device_id or "").strip() or self._get_cookie_value_by_name("oai-did")
-        if not device_id:
-            device_id = str(uuid.uuid4())
-            self.result.device_id = device_id
-
-        sentinel = self.get_sentinel_token(device_id)
-        step = self.authorize_continue(
-            email=email,
-            sentinel_token=sentinel,
-            screen_hint="login",
-            referer="https://auth.openai.com/log-in",
-            trace_step="authorize_continue_login_codex",
-        )
-        page_type = self._extract_page_type(step)
-        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
-
-        if page_type == "login_password" or "/log-in/password" in continue_url:
-            step = self.login_password_verify(password)
-            page_type = self._extract_page_type(step)
-            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
-
-        # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
-        if self._is_mfa_challenge_state(page_type, continue_url):
-            totp_secret = (self.result.totp_secret or "").strip()
-            if not totp_secret and self._account_callback:
-                # 从数据库加载凭证
-                try:
-                    cred = self._account_callback(email)
-                    if cred and cred.get("totp_secret"):
-                        totp_secret = cred["totp_secret"]
-                        self.result.totp_secret = totp_secret
-                        logger.info("已从数据库加载 totp_secret")
-                except Exception as e:
-                    logger.warning(f"account_callback 异常: {e}")
-            if not totp_secret:
-                logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
-                return continue_url or ""
-            # 从 continue_url 提取 challenge_id
-            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
-            if not challenge_id:
-                logger.warning("无法从 continue_url 提取 challenge_id")
-                return continue_url or ""
-            # 计算当前 TOTP 码并提交
-            totp_code = _totp_now(totp_secret)
-            logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
-            mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
-            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(mfa_resp))
-
-        need_otp = (page_type == "email_otp_verification") or ("/email-verification" in (continue_url or ""))
-        if need_otp:
-            if mail_provider is None:
-                logger.warning("Codex 登录推进需要 OTP，但未提供 mail_provider")
-                return continue_url or ""
-            try:
-                otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "60")))
-            except Exception:
-                otp_timeout = 180
-            otp_sent_at = time.time()
-            if not self.kickoff_otp_delivery("codex_login_need_otp"):
-                self.send_otp()
-            otp_code = mail_provider.wait_for_otp(
-                email,
-                timeout=otp_timeout,
-                issued_after=otp_sent_at,
-            )
-            otp_resp = self.verify_otp(otp_code)
-            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
-
-        # add-phone 分支（可选）：
-        # 仅在配置了手机号与验证码获取方式时尝试自动推进
-        if self._is_add_phone_state(page_type="", continue_url=continue_url):
-            next_url = self._handle_add_phone_verification(continue_url=continue_url)
-            if next_url:
-                continue_url = self._normalize_continue_url(next_url)
-
-        return continue_url or ""
+        try:
+            return self._advance_login_factors(mail_provider, email)
+        except Exception as e:
+            logger.warning(f"Codex 登录推进失败: {e}")
+            return ""
 
     @staticmethod
     def _is_add_phone_state(page_type: str = "", continue_url: str = "") -> bool:
@@ -991,6 +975,242 @@ class AuthFlow:
         pt = (page_type or "").strip().lower()
         cu = (continue_url or "").strip().lower()
         return (pt == "mfa_challenge") or ("/mfa-challenge/" in cu)
+
+    @staticmethod
+    def _is_password_login_page(page_type: str = "", continue_url: str = "") -> bool:
+        pt = (page_type or "").strip().lower()
+        cu = (continue_url or "").strip().lower()
+        return (pt == "login_password") or ("/log-in/password" in cu)
+
+    @staticmethod
+    def _is_otp_login_page(page_type: str = "", continue_url: str = "") -> bool:
+        pt = (page_type or "").strip().lower()
+        cu = (continue_url or "").strip().lower()
+        return (
+            pt in ("email_otp_verification", "passwordless_login")
+            or ("/email-verification" in cu)
+        )
+
+    @staticmethod
+    def _extract_page_payload(resp_json: dict | None) -> dict:
+        if not isinstance(resp_json, dict):
+            return {}
+        page = resp_json.get("page") if isinstance(resp_json.get("page"), dict) else {}
+        payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
+        return payload
+
+    def _otp_timeout(self) -> int:
+        try:
+            return max(10, int(self._get_env("OTP_TIMEOUT", "60")))
+        except Exception:
+            return 180
+
+    def _load_totp_secret(self, email: str = "") -> str:
+        totp = (self.result.totp_secret or "").strip()
+        if totp:
+            return totp
+        if not self._account_callback:
+            return ""
+        try:
+            cred = self._account_callback((email or self.result.email or "").strip()) or {}
+            totp = (cred.get("totp_secret") or "").strip()
+            if totp:
+                self.result.totp_secret = totp
+                logger.info("已从数据库加载 totp_secret")
+        except Exception as e:
+            logger.warning(f"account_callback 异常: {e}")
+        return totp
+
+    def _submit_mfa_if_needed(self, page_type: str, continue_url: str, email: str = "") -> tuple[str, str]:
+        """密码或 OTP 之后若停在 mfa-challenge，必须交 TOTP。没有 secret 就报错，禁止把 MFA URL 当重定向去跟。"""
+        continue_url = self._normalize_continue_url(continue_url)
+        if not self._is_mfa_challenge_state(page_type, continue_url):
+            return page_type, continue_url
+        totp_secret = self._load_totp_secret(email)
+        if not totp_secret:
+            raise RuntimeError("进入 mfa-challenge 但没有 totp_secret，无法继续")
+        challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in (continue_url or "") else ""
+        if not challenge_id:
+            raise RuntimeError("无法从 continue_url 提取 mfa challenge_id")
+        totp_code = _totp_now(totp_secret)
+        logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+        mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+        next_type = (self._extract_page_type(mfa_resp) or "").lower()
+        next_url = self._normalize_continue_url(self._extract_continue_url_from_step(mfa_resp))
+        return next_type, next_url
+
+    def _kickoff_login_otp(self, mode: str = "login_need_otp") -> bool:
+        """已有账号登录只 resend，不 send。409 再 resend 一次（实测 passwordless 首次 resend 常 409）。"""
+        self._is_existing_account = True
+        if self.resend_otp("https://auth.openai.com/email-verification"):
+            return True
+        logger.warning(f"登录 OTP 首次 resend 失败 (mode={mode})，再 resend 一次（不 send）")
+        return self.resend_otp("https://auth.openai.com/email-verification")
+
+    def _wait_and_verify_login_otp(self, mail_provider: MailProvider, mode: str = "login_need_otp") -> dict:
+        if mail_provider is None:
+            raise RuntimeError("登录需要 OTP，但未提供 mail_provider")
+        email = (self.result.email or "").strip()
+        otp_timeout = self._otp_timeout()
+        otp_sent_at = time.time()
+        if not self._kickoff_login_otp(mode):
+            # authorize/continue 往往已经发过码，resend 全失败也先等短窗口
+            otp_sent_at = time.time() - 8
+            logger.warning("登录 OTP resend 未成功，按 authorize 已发码等待邮件")
+        try:
+            otp_code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=otp_sent_at)
+        except TimeoutError:
+            logger.warning("未等到登录 OTP，再 resend 后重试")
+            otp_sent_at = time.time()
+            self._kickoff_login_otp(f"{mode}_timeout_retry")
+            otp_code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=otp_sent_at)
+        try:
+            return self.verify_otp(otp_code)
+        except RuntimeError as e:
+            if any(code in str(e) for code in ("401", "409")):
+                logger.warning(f"OTP 首次验证失败，重发重试: {e}")
+                otp_sent_at = time.time()
+                self._kickoff_login_otp(f"{mode}_verify_retry")
+                otp_code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=otp_sent_at)
+                return self.verify_otp(otp_code)
+            raise
+
+    def _advance_login_factors(
+        self,
+        mail_provider: Optional[MailProvider],
+        email: str,
+        login_password: str = "",
+        step: Optional[dict] = None,
+    ) -> str:
+        """screen_hint=login 之后按两页推进：密码或 OTP，然后 2FA。返回可跟的 continue_url。"""
+        email = (email or self.result.email or "").strip()
+        self.result.email = email
+        self._is_existing_account = True
+
+        if step is None:
+            device_id = (self.result.device_id or "").strip() or self._get_cookie_value_by_name("oai-did")
+            if not device_id:
+                device_id = str(uuid.uuid4())
+                self.result.device_id = device_id
+            sentinel = self.get_sentinel_token(device_id)
+            step = self.authorize_continue(
+                email=email,
+                sentinel_token=sentinel,
+                screen_hint="login",
+                referer="https://auth.openai.com/log-in",
+                trace_step="authorize_continue_login_factors",
+            )
+
+        page_type = (self._extract_page_type(step) or "").lower()
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+        payload = self._extract_page_payload(step)
+        mode = (payload.get("email_verification_mode") or "").strip().lower()
+        self._existing_page_type = page_type
+        self._existing_email_verification_mode = mode
+
+        if self._is_password_login_page(page_type, continue_url):
+            logger.info("登录分支: login_password -> password/verify")
+            pwd = (login_password or "").strip()
+            if not pwd:
+                resolved, pw_is_real = self._resolve_login_password(email)
+                pwd = resolved if pw_is_real else ""
+            if not pwd:
+                logger.warning("OpenAI 要密码但本地没有已知密码，回落到 OTP")
+                otp_resp = self._wait_and_verify_login_otp(mail_provider, "login_password_no_local_pw")
+                page_type = (self._extract_page_type(otp_resp) or "").lower()
+                continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+            else:
+                try:
+                    login_resp = self.login_password_verify(pwd)
+                except AccountDeactivatedError:
+                    raise
+                except Exception as e:
+                    if _looks_account_deactivated(str(e)):
+                        logger.error("password/verify 判定封号，不再走 OTP")
+                        raise AccountDeactivatedError(str(e)) from e
+                    logger.warning(f"password/verify 失败，回落到 OTP: {e}")
+                    otp_resp = self._wait_and_verify_login_otp(mail_provider, "login_password_verify_failed")
+                    page_type = (self._extract_page_type(otp_resp) or "").lower()
+                    continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+                else:
+                    # 只有 verify 成功才把密码写进 result，避免失败日志把库内残留打成「本轮生成」
+                    self.result.password = pwd
+                    self.result.password_on_openai = True
+                    page_type = (self._extract_page_type(login_resp) or "").lower()
+                    continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(login_resp))
+                    if self._is_otp_login_page(page_type, continue_url):
+                        otp_resp = self._wait_and_verify_login_otp(mail_provider, "login_password_need_otp")
+                        page_type = (self._extract_page_type(otp_resp) or "").lower()
+                        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+        elif self._is_otp_login_page(page_type, continue_url) or mode == "passwordless_login":
+            logger.info("登录分支: email_otp_verification mode=%s — 不使用库内密码", mode or "(empty)")
+            self.result.password_on_openai = False
+            otp_resp = self._wait_and_verify_login_otp(mail_provider, "passwordless_login")
+            page_type = (self._extract_page_type(otp_resp) or "").lower()
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+        else:
+            logger.info(
+                "login hint 未命中密码/OTP 页: page_type=%s continue_url=%s",
+                page_type or "(empty)",
+                (continue_url or "")[:180] or "(empty)",
+            )
+
+        page_type, continue_url = self._submit_mfa_if_needed(page_type, continue_url, email)
+        if self._is_add_phone_state(page_type=page_type, continue_url=continue_url):
+            next_url = self._handle_add_phone_verification(continue_url=continue_url)
+            if next_url:
+                continue_url = self._normalize_continue_url(next_url)
+        return continue_url or ""
+
+    def _establish_chatgpt_session(
+        self,
+        continue_url: str,
+        auth_url: str,
+        mail_provider: Optional[MailProvider] = None,
+    ) -> tuple[str, str]:
+        """因子走完后拿 chatgpt callback + session。MFA URL 禁止当重定向去跟。"""
+        continue_url = self._normalize_continue_url(continue_url or "")
+        if self._is_mfa_challenge_state("", continue_url):
+            raise RuntimeError("仍停在 mfa-challenge，不能把 MFA URL 当重定向跟踪")
+
+        callback_url = ""
+        final_url = ""
+        if continue_url and "/api/auth/callback/openai" in continue_url and "code=" in continue_url:
+            callback_url = continue_url
+            logger.info("continue_url 已是 chatgpt callback（未消费）")
+        elif continue_url:
+            callback_url, final_url = self.follow_redirect_chain(continue_url)
+            if (not callback_url) and final_url and ("/workspace" in final_url):
+                normalized = self._normalize_continue_url(final_url)
+                if normalized and normalized != final_url:
+                    callback_url, final_url = self.follow_redirect_chain(normalized)
+
+        if not callback_url:
+            logger.info("无 chatgpt callback，尝试 reauthorize")
+            ra = self._reauthorize_for_session(auth_url) or ""
+            if ra and "/api/auth/callback/openai" in ra and "code=" in ra:
+                callback_url = ra
+            elif ra:
+                callback_url, final_url = self.follow_redirect_chain(ra)
+
+        if not callback_url:
+            logger.info("reauthorize 仍无 callback，去掉 prompt=login 重打 signin")
+            try:
+                csrf = self.get_csrf_token()
+                fresh = self.get_auth_url(csrf, email=(self.result.email or ""))
+                fresh = self._drop_query_keys(fresh, {"prompt"})
+                ra = self._reauthorize_for_session(fresh) or ""
+                if ra and "/api/auth/callback/openai" in ra and "code=" in ra:
+                    callback_url = ra
+                elif ra:
+                    callback_url, final_url = self.follow_redirect_chain(ra)
+            except Exception as e:
+                logger.warning(f"去 prompt 重打 signin 失败: {e}")
+
+        if callback_url:
+            self._consume_callback_for_session(callback_url)
+        self.get_auth_session()
+        return callback_url, continue_url
 
     def _phone_headers(self, referer: str) -> dict:
         headers = self._common_headers(referer)
@@ -2228,7 +2448,7 @@ class AuthFlow:
         )
         self._trace_http("send_email_otp", resp)
         if resp.status_code != 200:
-            raise RuntimeError(f"发送 OTP 失败: {resp.status_code} - {resp.text[:200]}")
+            _raise_auth_error("发送 OTP 失败", resp.status_code, resp.text or "")
         logger.info("OTP 已发送到邮箱")
 
     def send_passwordless_otp(self, referer: str = "https://auth.openai.com/create-account/password") -> bool:
@@ -2400,8 +2620,7 @@ class AuthFlow:
         )
         self._trace_http("login_password_verify", resp)
         if resp.status_code != 200:
-            body = (resp.text or "")[:260]
-            raise RuntimeError(f"密码登录失败: {resp.status_code} - {body}")
+            _raise_auth_error("密码登录失败", resp.status_code, resp.text or "")
         try:
             return resp.json()
         except Exception:
@@ -2433,8 +2652,7 @@ class AuthFlow:
         )
         self._trace_http("submit_mfa_totp", resp)
         if resp.status_code != 200:
-            body = (resp.text or "")[:260]
-            raise RuntimeError(f"TOTP 验证失败: {resp.status_code} - {body}")
+            _raise_auth_error("TOTP 验证失败", resp.status_code, resp.text or "")
         try:
             return resp.json()
         except Exception:
@@ -2455,7 +2673,7 @@ class AuthFlow:
         if resp.status_code != 200:
             body = (resp.text or "")
             logger.warning(f"verify_otp FULL body ({resp.status_code}): {body[:2000]}")
-            raise RuntimeError(f"OTP 验证失败: {resp.status_code} - {body[:260]}")
+            _raise_auth_error("OTP 验证失败", resp.status_code, body)
         logger.info("OTP 验证成功")
         try:
             return resp.json()
@@ -3151,7 +3369,7 @@ class AuthFlow:
         #   WEBUI_ALLOW_LOGIN 未设 (register-only 模式) → fast-fail mark dead 换下一个号
         # 这样 register-only 不被 honeypot 拖死, promo-link 又能复用已存在账号.
         #
-        # ⚠️ 这个分支对**所有号池型 provider** 生效（outlook / icloud_relay / 以后新增的），
+        # ⚠️ 这个分支对**所有号池型 provider** 生效（outlook / icloud / 以后新增的），
         #    不是 outlook 专属 —— 日志前缀用 provider 自己的 kind，别写死。
         pool_tag = getattr(mail_provider, "kind", "pool")
         is_pooled_existing = not is_new and getattr(mail_provider, "pooled", False)
@@ -3262,57 +3480,51 @@ class AuthFlow:
             if page_type == "login_password":
                 logger.info("已有账号进入 login_password 分支，先走密码校验再 OTP")
                 login_password, pw_is_real = self._resolve_login_password(email)
-                if pw_is_real:
-                    self.result.password = login_password
-                else:
-                    logger.info("该号无已知密码，用默认规则猜一个试试（多半 401）")
-                login_resp = self.login_password_verify(login_password)
-                login_page_type = self._extract_page_type(login_resp)
-                continue_url = self._normalize_continue_url(
-                    (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
-                )
-
-                # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
-                if self._is_mfa_challenge_state(login_page_type, continue_url):
-                    totp_secret = (self.result.totp_secret or "").strip()
-                    if not totp_secret and self._account_callback:
-                        # 从数据库加载凭证
-                        try:
-                            cred = self._account_callback(email)
-                            if cred and cred.get("totp_secret"):
-                                totp_secret = cred["totp_secret"]
-                                self.result.totp_secret = totp_secret
-                                logger.info("已从数据库加载 totp_secret")
-                        except Exception as e:
-                            logger.warning(f"account_callback 异常: {e}")
-                    if not totp_secret:
-                        logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
-                    else:
-                        challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
-                        if challenge_id:
-                            totp_code = _totp_now(totp_secret)
-                            logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
-                            mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
-                            continue_url = self._normalize_continue_url(
-                                (mfa_resp or {}).get("continue_url", "") if isinstance(mfa_resp, dict) else ""
+                if not pw_is_real:
+                    login_password = ""
+                    logger.info("该号无已知密码，回落到 OTP")
+                if login_password:
+                    try:
+                        login_resp = self.login_password_verify(login_password)
+                    except AccountDeactivatedError:
+                        raise
+                    except Exception as e:
+                        if _looks_account_deactivated(str(e)):
+                            logger.error("password/verify 判定封号，不再走 OTP")
+                            raise AccountDeactivatedError(str(e)) from e
+                        logger.warning(f"password/verify 失败，回落到 OTP: {e}")
+                        login_resp = None
+                    if login_resp is not None:
+                        self.result.password = login_password
+                        self.result.password_on_openai = True
+                        login_page_type = self._extract_page_type(login_resp)
+                        continue_url = self._normalize_continue_url(
+                            self._extract_continue_url_from_step(login_resp)
+                        )
+                        login_page_type, continue_url = self._submit_mfa_if_needed(
+                            login_page_type, continue_url, email
+                        )
+                        if self._is_otp_login_page(login_page_type, continue_url):
+                            otp_resp = self._wait_and_verify_login_otp(
+                                mail_provider, "existing_login_password"
                             )
-                        else:
-                            logger.warning("无法从 continue_url 提取 challenge_id")
-
-                # 部分账号密码校验后仍需 email otp（二次校验）
-                elif not continue_url or "/email-verification" in continue_url:
-                    # password/verify 后推荐使用 resend，而不是 /email-otp/send
-                    otp_sent_at = time.time()
-                    self.kickoff_otp_delivery("existing_login_password")
-                    otp_code = mail_provider.wait_for_otp(
-                        email,
-                        timeout=otp_timeout,
-                        issued_after=otp_sent_at,
-                    )
-                    otp_resp = self.verify_otp(otp_code)
-                    continue_url = self._normalize_continue_url(
-                        (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
-                    )
+                            continue_url = self._normalize_continue_url(
+                                self._extract_continue_url_from_step(otp_resp)
+                            )
+                            login_page_type = self._extract_page_type(otp_resp)
+                            login_page_type, continue_url = self._submit_mfa_if_needed(
+                                login_page_type, continue_url, email
+                            )
+                if not continue_url or self._is_otp_login_page(page_type, continue_url):
+                    if not (self.result.password or "").strip():
+                        otp_resp = self._wait_and_verify_login_otp(
+                            mail_provider, "existing_login_password_fallback"
+                        )
+                        continue_url = self._normalize_continue_url(
+                            self._extract_continue_url_from_step(otp_resp)
+                        )
+                        otp_page = self._extract_page_type(otp_resp)
+                        _, continue_url = self._submit_mfa_if_needed(otp_page, continue_url, email)
             else:
                 need_send_otp = mode not in ("passwordless_signup", "passwordless_login")
                 if need_send_otp:
@@ -3390,7 +3602,11 @@ class AuthFlow:
                         raise
                 continue_url = (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
                 continue_url = self._normalize_continue_url(continue_url)
-                if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
+                otp_page = self._extract_page_type(otp_resp)
+                if mode == "passwordless_login" or self._is_otp_login_page(page_type, continue_url):
+                    self.result.password_on_openai = False
+                otp_page, continue_url = self._submit_mfa_if_needed(otp_page, continue_url, email)
+                if self._is_add_phone_state(page_type=otp_page, continue_url=continue_url):
                     continue_url = self._normalize_continue_url(
                         self._handle_add_phone_verification(continue_url=continue_url)
                     )
@@ -3417,6 +3633,9 @@ class AuthFlow:
             if not continue_url:
                 # auth.openai.com 的 session cookie 已设置，直接拿 code
                 continue_url = self._reauthorize_for_session(auth_url)
+
+        if continue_url and self._is_mfa_challenge_state("", continue_url):
+            _, continue_url = self._submit_mfa_if_needed("", continue_url, self.result.email)
 
         if continue_url:
             continue_url = self._normalize_continue_url(continue_url)
@@ -3503,16 +3722,15 @@ class AuthFlow:
     def run_protocol_login(self, mail_provider: MailProvider, email: str, password: str = "") -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
-        - 适配 passwordless / login_password 两类已有账号入口
-        - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
+        - 一律 screen_hint=login 探测 /log-in/password 或 /email-verification
+        - 密码后、OTP 后都处理 mfa-challenge
+        - 只有 password/verify 成功才把密码写进 result
         """
         if not (email or "").strip():
             raise RuntimeError("run_protocol_login 缺少邮箱")
 
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试登录链路以获取精确错误...")
-        # 同 run_register：没 oai-did 就走不通 authorize 链，早失败早换 IP。
-        # 这里不花钱建邮箱，但报错说清原因，省得当成"密码错"排查。
         if not self.warmup():
             raise RuntimeError(
                 "warmup 失败：4 次重试均未拿到 chatgpt.com 的 oai-did cookie，"
@@ -3520,204 +3738,32 @@ class AuthFlow:
                 "请检查代理后重试"
             )
 
-        # run_protocol_login 的语义即"登录已有账号"（docstring 明写）。kickoff_otp_delivery
-        # 依据 _is_existing_account 选 resend vs send_passwordless_otp 分支；落到 send
-        # 分支会把 server-side state 弄坏 → 之后 IMAP 抓到的 OTP X 已失效 → verify 401
-        # wrong_email_otp_code。这里入口统一 set True，覆盖 passwordless 这类 page_type
-        # 不在 ("login_password","email_otp_verification") 集合的情况；signup() 回退
-        # 路径会基于 OpenAI 真实响应再次覆盖（True/False），无副作用。
         self._is_existing_account = True
-
         email = email.strip()
         self.result.email = email
+        # 调用方给的密码只拿去碰 password 页，成功才写入 result（见 _advance_login_factors）
         login_password = (password or "").strip()
-        if login_password:
-            self.result.password = login_password
-        else:
-            login_password, pw_is_real = self._resolve_login_password(email)
-            if pw_is_real:
-                self.result.password = login_password
-            else:
-                logger.info("协议登录：调用方没给密码、库里也没有，用默认规则猜一个试试")
 
         csrf_token = self.get_csrf_token()
         auth_url = self.get_auth_url(csrf_token, email=email)
-        device_id = self.auth_oauth_init(auth_url)
-        sentinel = self.get_sentinel_token(device_id)
+        self.auth_oauth_init(auth_url)
 
-        continue_url = ""
-        try:
-            otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "60")))
-        except Exception:
-            otp_timeout = 180
-
-        page_type = ""
-        mode = ""
-        prefer_login_screen_first = str(
-            os.getenv("LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT", "1")
-        ).lower() in ("1", "true", "yes", "on")
-
-        if prefer_login_screen_first:
-            try:
-                logger.info("已有账号协议登录：优先走 login screen_hint 探测 password/otp 分支")
-                login_step = self.authorize_continue(
-                    email=email,
-                    sentinel_token=sentinel,
-                    screen_hint="login",
-                    referer="https://auth.openai.com/log-in",
-                    trace_step="authorize_continue_login_protocol",
-                )
-                page_type = (self._extract_page_type(login_step) or "").lower()
-                continue_url = self._normalize_continue_url(
-                    self._extract_continue_url_from_step(login_step)
-                )
-                page = (login_step.get("page") or {}) if isinstance(login_step, dict) else {}
-                payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
-                mode = (payload.get("email_verification_mode", "") or "").lower()
-                self._existing_page_type = page_type
-                self._existing_email_verification_mode = mode
-
-                if page_type == "login_password" or "/log-in/password" in (continue_url or ""):
-                    logger.info("登录分支: login_password -> password/verify")
-                    # 命中已有账号 password 路径：标记之，让 kickoff_otp_delivery 走 resend
-                    # 分支（避免 send_passwordless_otp 把 state 弄坏 → wrong_email_otp_code）
-                    self._is_existing_account = True
-                    login_resp = self.login_password_verify(login_password)
-                    page_type = (self._extract_page_type(login_resp) or "").lower()
-                    continue_url = self._normalize_continue_url(
-                        self._extract_continue_url_from_step(login_resp)
-                    )
-
-                    # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
-                    if self._is_mfa_challenge_state(page_type, continue_url):
-                        totp_secret = (self.result.totp_secret or "").strip()
-                        if not totp_secret and self._account_callback:
-                            # 从数据库加载凭证
-                            try:
-                                cred = self._account_callback(email)
-                                if cred and cred.get("totp_secret"):
-                                    totp_secret = cred["totp_secret"]
-                                    self.result.totp_secret = totp_secret
-                                    logger.info("已从数据库加载 totp_secret")
-                            except Exception as e:
-                                logger.warning(f"account_callback 异常: {e}")
-                        if not totp_secret:
-                            logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
-                        else:
-                            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
-                            if challenge_id:
-                                totp_code = _totp_now(totp_secret)
-                                logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
-                                mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
-                                page_type = (self._extract_page_type(mfa_resp) or "").lower()
-                                continue_url = self._normalize_continue_url(
-                                    self._extract_continue_url_from_step(mfa_resp)
-                                )
-                            else:
-                                logger.warning("无法从 continue_url 提取 challenge_id")
-
-                elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
-                    logger.info("登录分支: email_otp_verification")
-                    # 同上：authorize/continue 已 trigger 发码，kickoff_otp_delivery 必须只 resend。
-                    self._is_existing_account = True
-                else:
-                    logger.info(
-                        "login screen_hint 未直接命中已有账号完成态: page_type=%s continue_url=%s",
-                        page_type or "(empty)",
-                        (continue_url or "")[:180] or "(empty)",
-                    )
-            except Exception as e:
-                logger.warning(f"login screen_hint 探测失败，回退 signup 探测: {e}")
-                continue_url = ""
-                page_type = ""
-                mode = ""
-
-        if not continue_url and page_type not in ("login_password", "email_otp_verification"):
-            is_new = self.signup(email, sentinel)
-            if is_new:
-                logger.warning("目标邮箱未命中已有账号分支，回退到注册链路")
-                self.register_password(email)
-                otp_sent_at = time.time()
-                self.send_otp()
-                otp_code = mail_provider.wait_for_otp(
-                    email,
-                    timeout=otp_timeout,
-                    issued_after=otp_sent_at,
-                )
-                self.verify_otp(otp_code)
-                continue_url = self.create_account()
-            else:
-                page_type = (self._existing_page_type or "").lower()
-                mode = (self._existing_email_verification_mode or "").lower()
-        else:
-            page_type = (page_type or self._existing_page_type or "").lower()
-            mode = (mode or self._existing_email_verification_mode or "").lower()
-
-        if not continue_url or "/email-verification" in continue_url:
-            # 仍需 OTP：优先 resend 获取新码
-            otp_sent_at = time.time()
-            resend_ok = self.kickoff_otp_delivery("protocol_need_otp")
-            if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
-                self.send_otp()
-                otp_sent_at = time.time()
-
-            otp_code = mail_provider.wait_for_otp(
-                email,
-                timeout=otp_timeout,
-                issued_after=otp_sent_at,
-            )
-            try:
-                otp_resp = self.verify_otp(otp_code)
-                self.fetch_client_auth_session_dump("post_verify_otp_protocol")
-            except RuntimeError as e:
-                if any(code in str(e) for code in ("401", "409")):
-                    logger.warning(f"OTP 首次验证失败，重发重试: {e}")
-                    otp_sent_at = time.time()
-                    if not self.kickoff_otp_delivery("protocol_verify_retry"):
-                        self.send_otp()
-                    otp_code = mail_provider.wait_for_otp(
-                        email,
-                        timeout=otp_timeout,
-                        issued_after=otp_sent_at,
-                    )
-                    otp_resp = self.verify_otp(otp_code)
-                    self.fetch_client_auth_session_dump("post_verify_otp_retry_protocol")
-                else:
-                    raise
-            continue_url = self._extract_continue_url_from_step(otp_resp)
-            continue_url = self._normalize_continue_url(continue_url)
-            if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
-                continue_url = self._normalize_continue_url(
-                    self._handle_add_phone_verification(continue_url=continue_url)
-                )
-
-        continue_url = self._normalize_continue_url(continue_url)
-        # 某些边缘态 OTP 后未返回 callback，回退 reauthorize
+        logger.info("已有账号协议登录：login screen_hint 探测 password/otp 分支")
+        continue_url = self._advance_login_factors(
+            mail_provider, email, login_password=login_password
+        )
         if not continue_url:
             continue_url = self._reauthorize_for_session(auth_url) or ""
 
         refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
-        callback_url = ""
-        if continue_url:
-            continue_url = self._normalize_continue_url(continue_url)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
-                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
-            pre_exchange_default = "1" if refresh_only_mode else "0"
-            pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
-            if pre_exchange:
-                self.oauth_token_exchange(continue_url, continue_url)
-            callback_url, final_url = self.follow_redirect_chain(continue_url)
-            if (not callback_url) and final_url and ("/workspace" in final_url):
-                normalized = self._normalize_continue_url(final_url)
-                if normalized and normalized != final_url:
-                    callback_url, final_url = self.follow_redirect_chain(normalized)
-
-        if not refresh_only_mode:
-            self.get_auth_session()
+        callback_url, continue_url = self._establish_chatgpt_session(
+            continue_url, auth_url, mail_provider=mail_provider
+        )
 
         if callback_url or continue_url:
             self.fetch_client_auth_session_dump("pre_oauth_exchange_protocol")
-            self.oauth_token_exchange(callback_url or "", continue_url or "")
+            if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0"):
+                self.oauth_token_exchange(callback_url or "", continue_url or "")
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):

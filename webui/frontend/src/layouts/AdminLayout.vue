@@ -50,10 +50,13 @@ const statPills = computed(() => [
   { label: '失败', value: stats.value.failed, type: 'danger' },
 ])
 
-onMounted(() => {
+onMounted(async () => {
   theme.apply()
   statsStore.startPolling()
-  runtime.connectAutoStream()
+  // 先回放磁盘日志（短 XHR），SSE 延后：HTTP/1.1 每域 6 条连接，
+  // 重新授权在跑时立刻占满 stream，F5 的 /api/registered 会排队转圈。
+  await runtime.restoreLogs()
+  window.setTimeout(() => runtime.connectEvents(), 400)
 })
 </script>
 <template>

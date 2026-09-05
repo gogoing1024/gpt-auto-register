@@ -77,7 +77,7 @@ FORMATS: list[ExportFormat] = [
     # 比上面那条多一段中转取件链接。
     # ⚠️ relay_url 不在 registered 表里，是 db.list_registered_full /
     #    list_registered_by_emails 从号池表（outlook_accounts）LEFT JOIN 带出来的。
-    #    所以：① 只有 icloud_relay 这类「一号一条取件链接」的号有值；
+    #    所以：① 只有 icloud 这类「一号一条取件链接」的号有值；
     #          ② 号池那行被删掉了就是空 —— 照约定留空、分隔符保留，不跳行。
     #    链接里嵌着 token，等于这个邮箱的收件权限，导出来的文件请当密码保管。
     ExportFormat(

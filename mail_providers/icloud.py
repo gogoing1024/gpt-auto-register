@@ -100,10 +100,10 @@ def parse_latest(raw: str) -> Optional[dict]:
 
 
 @register
-class ICloudRelayProvider(MailProvider):
+class ICloudProvider(MailProvider):
     """iCloud 邮箱（/openapi/mail/{email}/{token}/latest）。"""
 
-    kind = "icloud_relay"
+    kind = "icloud"
     display_name = "iCloud 邮箱"
     pooled = True
     ephemeral = False
