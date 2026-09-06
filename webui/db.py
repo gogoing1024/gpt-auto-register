@@ -931,7 +931,11 @@ def _registered_where(filt: str, search: str = "") -> tuple[str, list]:
     elif filt == "banned":
         where_clauses.append("extra_json LIKE '%\"banned\"%'")
     elif filt == "no_password":
-        where_clauses.append("coalesce(length(password), 0) = 0")
+        # 只认探测结果 password_on_openai=false，不看本地 password 列是否为空
+        where_clauses.append(
+            "(extra_json LIKE '%\"password_on_openai\": false%' "
+            "OR extra_json LIKE '%\"password_on_openai\":false%')"
+        )
     elif filt == "no_2fa":
         where_clauses.append("coalesce(length(totp_secret), 0) = 0")
     elif filt == "token_invalid":

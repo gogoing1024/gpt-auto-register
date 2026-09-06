@@ -635,9 +635,9 @@ def _save_set_password_early(email: str, password: str) -> None:
             "password": password,
             "password_on_openai": True,
         })
-        log.info(f"[设置密码] 密码已落盘并标记已设密: {email}")
+        log.info(f"[补全密码] 密码已落盘并标记已设密: {email}")
     except Exception as e:
-        log.warning(f"[设置密码] 密码落盘失败，仅剩日志兜底: {e}")
+        log.warning(f"[补全密码] 密码落盘失败，仅剩日志兜底: {e}")
 
 
 def _save_password_early(email: str, password: str) -> None:
@@ -737,7 +737,7 @@ def _reauth_action(options: Optional[dict] = None) -> str:
 
 
 def _reauth_label(action: str) -> str:
-    return "设置密码" if action == "set_password" else "重新授权"
+    return "补全密码" if action == "set_password" else "重新授权"
 
 
 def _reauth_tag(action: str) -> str:
@@ -849,7 +849,7 @@ def _start_reauth_one(email: str, options: dict) -> str:
 
 
 def start_reauth(emails: list[str], options: dict) -> str:
-    """启动重新授权或设置密码（不 claim 号池）。每个邮箱一个 run；多个则顺序排队。"""
+    """启动重新授权或补全密码（不 claim 号池）。每个邮箱一个 run；多个则顺序排队。"""
     action = _reauth_action(options)
     label = _reauth_label(action)
     cleaned = []
@@ -866,7 +866,7 @@ def start_reauth(emails: list[str], options: dict) -> str:
     n = len(cleaned)
     with _reauth_batch_lock:
         if _reauth_batch.get("active"):
-            raise RuntimeError("已有重新授权或设置密码队列在跑")
+            raise RuntimeError("已有重新授权或补全密码队列在跑")
         _reauth_batch.update(active=True, total=n, ok=0, fail=0, current="", action=action)
     _broadcast_reauth("state", get_reauth_snapshot())
     try:

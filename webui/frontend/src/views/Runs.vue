@@ -105,7 +105,7 @@ onActivated(() => load())
         </el-table-column>
         <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
         <el-table-column label="类型" width="100">
-          <template #default="{ row }">{{ row.kind === 'setpwd' ? '设置密码' : row.kind === 'reauth' ? '重新授权' : '注册' }}</template>
+          <template #default="{ row }">{{ row.kind === 'setpwd' ? '补全密码' : row.kind === 'reauth' ? '重新授权' : '注册' }}</template>
         </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">

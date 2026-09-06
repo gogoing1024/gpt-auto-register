@@ -26,7 +26,7 @@ const runtime = useRuntimeStore()
 const { runningReauth, lastReauthResult, reauthBatch, dataVersion, reauthRestoreOpen } = storeToRefs(runtime)
 
 function jobLabel(action) {
-  return action === 'set_password' ? '设置密码' : '重新授权'
+  return action === 'set_password' ? '补全密码' : '重新授权'
 }
 function batchAction() {
   return reauthBatch.value?.action || 'reauth'
@@ -452,14 +452,14 @@ async function reauthSelected() {
 
 async function setPasswordOne(row) {
   if (!isNoOpenAiPassword(row)) { ElMessage.info('该号已在 OpenAI 设密'); return }
-  if (!(await confirm(`给 ${row.email} 设置密码？\n登录走邮箱验证码（有 2FA 再过 TOTP）。优先用库里已有密码，没有则随机生成。`))) return
+  if (!(await confirm(`给 ${row.email} 补全密码？\n登录走邮箱验证码（有 2FA 再过 TOTP）。优先用库里已有密码，没有则随机生成。`))) return
   await startAuthEmails([row.email], 'set_password')
 }
 
 async function setPasswordSelected() {
   const emails = selected.value.filter(isNoOpenAiPassword).map((r) => r.email)
   if (!emails.length) { ElMessage.info('请先勾选「未在 OpenAI 设密」的号'); return }
-  if (!(await confirm(`给选中的 ${emails.length} 个无密号设置密码？优先用库里已有密码，没有则随机生成。`))) return
+  if (!(await confirm(`给选中的 ${emails.length} 个无密号补全密码？优先用库里已有密码，没有则随机生成。`))) return
   await startAuthEmails(emails, 'set_password')
 }
 
@@ -844,7 +844,7 @@ onUnmounted(() => {
           :disabled="!selected.filter(isNoOpenAiPassword).length"
           @click="setPasswordSelected"
         >
-          设置密码选中 ({{ selected.filter(isNoOpenAiPassword).length }})
+          补全密码选中 ({{ selected.filter(isNoOpenAiPassword).length }})
         </el-button>
         <el-switch v-model="form.autoCheckPlus" active-text="自动检测" />
       </el-space>
@@ -958,7 +958,7 @@ onUnmounted(() => {
                       v-if="isNoOpenAiPassword(row)"
                       command="set_password"
                       :disabled="runningReauth"
-                    >设置密码</el-dropdown-item>
+                    >补全密码</el-dropdown-item>
                     <el-dropdown-item command="edit">编辑</el-dropdown-item>
                     <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
                   </el-dropdown-menu>

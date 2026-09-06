@@ -934,7 +934,7 @@ class ReauthReq(BaseModel):
 
 def _start_registered_auth(req: ReauthReq, *, action: str):
     emails = [(e or "").strip().lower() for e in (req.emails or []) if (e or "").strip()]
-    label = "设置密码" if action == "set_password" else "重新授权"
+    label = "补全密码" if action == "set_password" else "重新授权"
     if not emails:
         raise HTTPException(400, f"没有要{label}的邮箱")
     if action == "set_password":

@@ -837,14 +837,12 @@ class AuthFlow:
                     or ("/consent" in current)
                 )
                 if is_workspace_like:
-                    workspace_id = self._extract_workspace_id() or self._extract_workspace_id_from_html(resp.text or "")
-                    if workspace_id:
-                        next_url = self._workspace_select(workspace_id)
-                        if next_url:
-                            if next_url.startswith("/"):
-                                next_url = urljoin("https://auth.openai.com", next_url)
-                            current = next_url
-                            continue
+                    next_url = self._select_workspace_from_page(resp.text or "", current)
+                    if next_url:
+                        if next_url.startswith("/"):
+                            next_url = urljoin("https://auth.openai.com", next_url)
+                        current = next_url
+                        continue
 
                 # /choose-an-account：OpenAI 已登录多账号的选择页（react-router SSR）。
                 # HTML 里 streamController.enqueue 注入 unified_sessions[].id (us_*) 和
@@ -3038,9 +3036,7 @@ class AuthFlow:
 
         # 尝试 workspace select
         if not continue_url:
-            workspace_id = self._extract_workspace_id()
-            if workspace_id:
-                continue_url = self._workspace_select(workspace_id)
+            continue_url = self._select_workspace_from_page() or continue_url
 
         if not continue_url:
             raise RuntimeError("创建账户后未获取到 continue_url")
@@ -3048,37 +3044,307 @@ class AuthFlow:
         logger.info("账户创建成功")
         return continue_url
 
-    def _extract_workspace_id(self) -> str:
-        """从 cookie 中提取 workspace_id"""
+    def _iter_auth_session_cookie_payloads(self) -> list[dict]:
+        """解码 oai-client-auth-session cookie 里能解开的 JSON 段。"""
+        out: list[dict] = []
         try:
-            auth_session = self.session.cookies.get("oai-client-auth-session", "")
-            if auth_session:
-                parts = auth_session.split(".")
-                # 兼容不同 cookie 形态：workspace_id 可能在第 1 段/第 2 段，也可能在 workspaces[0].id
-                for idx in range(min(2, len(parts))):
-                    segment = (parts[idx] or "").strip()
-                    if not segment:
-                        continue
+            auth_session = self.session.cookies.get("oai-client-auth-session", "") or ""
+            if not auth_session:
+                auth_session = self._get_cookie_value_by_name("oai-client-auth-session") or ""
+            parts = (auth_session or "").split(".")
+            for segment in parts[:3]:
+                segment = (segment or "").strip()
+                if not segment:
+                    continue
+                try:
                     payload_b64 = segment + "=" * (-len(segment) % 4)
-                    decoded = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
-                    if not isinstance(decoded, dict):
-                        continue
-                    wid = (decoded.get("workspace_id", "") or "").strip()
-                    if wid:
-                        return wid
-                    workspaces = decoded.get("workspaces", [])
-                    if isinstance(workspaces, list):
-                        for it in workspaces:
-                            if isinstance(it, dict):
-                                wid = (it.get("id", "") or "").strip()
-                                if wid:
-                                    return wid
+                    decoded = json.loads(
+                        base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+                    )
+                except Exception:
+                    continue
+                if isinstance(decoded, dict):
+                    out.append(decoded)
         except Exception:
-            pass
+            return out
+        return out
+
+    @staticmethod
+    def _workspace_id_of(item: Any) -> str:
+        if isinstance(item, str):
+            return item.strip()
+        if not isinstance(item, dict):
+            return ""
+        for key in ("id", "workspace_id", "workspaceId", "account_id"):
+            val = str(item.get(key) or "").strip()
+            if val:
+                return val
+        return ""
+
+    @staticmethod
+    def _normalize_workspace_item(item: Any) -> dict:
+        if isinstance(item, dict):
+            wid = AuthFlow._workspace_id_of(item)
+            out = dict(item)
+            if wid and not out.get("id"):
+                out["id"] = wid
+            return out
+        wid = AuthFlow._workspace_id_of(item)
+        return {"id": wid} if wid else {}
+
+    @staticmethod
+    def _slice_json_value(text: str, start: int) -> str:
+        if start < 0 or start >= len(text):
+            return ""
+        opener = text[start]
+        closer = {"[": "]", "{": "}"}.get(opener)
+        if not closer:
+            return ""
+        depth = 0
+        in_str = False
+        esc = False
+        limit = min(len(text), start + 250000)
+        for i in range(start, limit):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        return ""
+
+    @staticmethod
+    def _extract_workspaces_from_html(html_text: str) -> list[dict]:
+        """从 workspace 页 HTML / React stream 抽出全部 workspace 对象。"""
+        if not html_text:
+            return []
+        text = (html_text or "").replace('\\"', '"').replace("\\/", "/")
+        found: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(item: Any) -> None:
+            obj = AuthFlow._normalize_workspace_item(item)
+            wid = AuthFlow._workspace_id_of(obj)
+            if not wid or wid in seen:
+                return
+            seen.add(wid)
+            found.append(obj)
+
+        for key in ("workspaces", "available_workspaces", "workspace_list"):
+            needle = f'"{key}"'
+            idx = 0
+            while True:
+                pos = text.find(needle, idx)
+                if pos < 0:
+                    break
+                idx = pos + len(needle)
+                colon = text.find(":", idx, idx + 16)
+                if colon < 0:
+                    continue
+                start = colon + 1
+                while start < len(text) and text[start] in " \t\r\n":
+                    start += 1
+                raw = AuthFlow._slice_json_value(text, start)
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(parsed, list):
+                    for it in parsed:
+                        _add(it)
+                elif isinstance(parsed, dict):
+                    inner = parsed.get("workspaces") or parsed.get("items") or parsed.get("data")
+                    if isinstance(inner, list):
+                        for it in inner:
+                            _add(it)
+                    else:
+                        _add(parsed)
+
+        if not found:
+            for m in re.finditer(
+                r'\{[^{}]{0,800}"(?:id|workspace_id|workspaceId)"\s*:\s*"([0-9a-fA-F-]{36})"[^{}]{0,800}\}',
+                text,
+            ):
+                try:
+                    obj = json.loads(m.group(0))
+                except Exception:
+                    continue
+                keys = {str(k).lower() for k in obj}
+                if keys & {
+                    "name", "title", "plan_type", "plantype", "structure",
+                    "organization_id", "organizationid", "workspace_id", "workspaceid",
+                }:
+                    _add(obj)
+        return found
+
+    def _collect_workspaces(self, html_text: str = "") -> list[dict]:
+        found: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(item: Any) -> None:
+            obj = self._normalize_workspace_item(item)
+            wid = self._workspace_id_of(obj)
+            if not wid or wid in seen:
+                return
+            seen.add(wid)
+            found.append(obj)
+
+        for payload in self._iter_auth_session_cookie_payloads():
+            wid = (payload.get("workspace_id") or payload.get("workspaceId") or "").strip()
+            if wid:
+                _add({"id": wid, "source": "cookie.workspace_id"})
+            for key in ("workspaces", "available_workspaces", "workspace_list"):
+                items = payload.get(key)
+                if isinstance(items, list):
+                    for it in items:
+                        _add(it)
+        for it in self._extract_workspaces_from_html(html_text):
+            _add(it)
+        return found
+
+    def _log_workspaces(self, workspaces: list[dict], source: str = "") -> None:
+        src = (source or "unknown").strip() or "unknown"
+        n = len(workspaces)
+        logger.info("需要选择 workspace（%s），共 %s 个", src[:180], n)
+        if not workspaces:
+            logger.info("workspace 列表为空：cookie/HTML 未解析到 workspace")
+            return
+        for i, ws in enumerate(workspaces, 1):
+            logger.info(
+                "  workspace[%s] id=%s name=%s type=%s plan=%s org=%s",
+                i,
+                self._workspace_id_of(ws) or "-",
+                (ws.get("name") or ws.get("title") or "-"),
+                (ws.get("structure") or ws.get("type") or "-"),
+                (ws.get("plan_type") or ws.get("planType") or "-"),
+                (ws.get("organization_id") or ws.get("organizationId") or "-"),
+            )
+        raw = json.dumps(workspaces, ensure_ascii=False, default=str)
+        logger.info("workspace 全部信息: %s", raw[:8000])
+        if len(raw) > 8000:
+            logger.info("workspace 全部信息已截断，原始长度=%s", len(raw))
+
+    def _select_workspace_from_page(self, html_text: str = "", page_url: str = "") -> str:
+        """碰到 workspace 选择页：先打印全部 workspace，再选一个继续。"""
+        workspaces = self._collect_workspaces(html_text)
+        on_page = bool((html_text or "").strip()) or "workspace" in (page_url or "").lower()
+        if workspaces or on_page:
+            self._log_workspaces(workspaces, page_url or "workspace")
+        wid = ""
+        for ws in workspaces:
+            wid = self._workspace_id_of(ws)
+            if wid:
+                break
+        if not wid:
+            wid = self._extract_query_first(page_url, ["workspace_id", "id"])
+        if not wid:
+            logger.warning("需要选择 workspace，但未提取到 workspace_id")
+            return ""
+        return self._workspace_select(wid)
+
+    def _log_chatgpt_accounts_after_login(self) -> None:
+        """登录拿到 AT 后，把 accounts/check 里全部 workspace/账户打出来。"""
+        if getattr(self, "_chatgpt_workspaces_logged", False):
+            return
+        access_token = (self.result.access_token or "").strip()
+        if not access_token:
+            return
+        self._chatgpt_workspaces_logged = True
+        account_id = ""
+        try:
+            payload_b64 = access_token.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+            auth = payload.get("https://api.openai.com/auth") if isinstance(payload, dict) else {}
+            if isinstance(auth, dict):
+                account_id = str(auth.get("chatgpt_account_id") or auth.get("account_id") or "").strip()
+        except Exception:
+            account_id = ""
+        headers = self._common_headers("https://chatgpt.com/")
+        headers["Authorization"] = f"Bearer {access_token}"
+        headers["Accept"] = "application/json"
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+        try:
+            resp = self.session.get(
+                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+                headers=headers,
+                timeout=20,
+            )
+            self._trace_http("chatgpt_accounts_check_workspaces", resp)
+        except Exception as e:
+            logger.warning("登录后拉取 workspace 列表失败: %s", e)
+            return
+        if resp.status_code != 200:
+            logger.warning("登录后 workspace 列表 HTTP %s", resp.status_code)
+            return
+        try:
+            data = resp.json() if resp is not None else {}
+        except Exception:
+            logger.warning("登录后 workspace 列表 JSON 解析失败")
+            return
+        if not isinstance(data, dict):
+            return
+        accounts = data.get("accounts") if isinstance(data.get("accounts"), dict) else {}
+        ordering = data.get("account_ordering") or []
+        logger.info(
+            "登录后 workspace/账户 共 %s 个 ordering=%s",
+            len(accounts),
+            ordering if isinstance(ordering, list) else [],
+        )
+        items = []
+        if isinstance(ordering, list) and ordering:
+            items = [(str(k), accounts.get(k)) for k in ordering if k in accounts]
+            for k, v in accounts.items():
+                if k not in {str(x) for x in ordering}:
+                    items.append((str(k), v))
+        else:
+            items = [(str(k), v) for k, v in accounts.items()]
+        for i, (key, info) in enumerate(items, 1):
+            info = info if isinstance(info, dict) else {}
+            acct = info.get("account") if isinstance(info.get("account"), dict) else {}
+            ent = info.get("entitlement") if isinstance(info.get("entitlement"), dict) else {}
+            logger.info(
+                "  workspace[%s] key=%s id=%s name=%s structure=%s plan=%s org=%s sub=%s deactivated=%s",
+                i,
+                key,
+                acct.get("account_id") or key,
+                acct.get("name") or "-",
+                acct.get("structure") or "-",
+                acct.get("plan_type") or "-",
+                acct.get("organization_id") or "-",
+                ent.get("has_active_subscription"),
+                acct.get("is_deactivated"),
+            )
+        raw = json.dumps(data, ensure_ascii=False, default=str)
+        logger.info("登录后 workspace 全部信息: %s", raw[:8000])
+        if len(raw) > 8000:
+            logger.info("登录后 workspace 全部信息已截断，原始长度=%s", len(raw))
+
+    def _extract_workspace_id(self) -> str:
+        """从 cookie / 已收集列表里取第一个 workspace_id。"""
+        for ws in self._collect_workspaces():
+            wid = self._workspace_id_of(ws)
+            if wid:
+                return wid
         return ""
 
     def _workspace_select(self, workspace_id: str) -> str:
-        logger.info("执行 workspace 选择...")
+        logger.info("执行 workspace 选择 workspace_id=%s ...", workspace_id)
         headers = self._common_headers("https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
         headers["Content-Type"] = "application/json"
         resp = self.session.post(
@@ -3181,33 +3447,17 @@ class AuthFlow:
         if out.startswith("/"):
             out = urljoin("https://auth.openai.com", out)
         if "/workspace" in out:
-            workspace_id = self._extract_workspace_id() or self._extract_query_first(out, ["workspace_id", "id"])
-            if workspace_id:
-                logger.info("检测到 workspace 页面，尝试 workspace/select: workspace_id=%s", workspace_id)
-                next_url = self._workspace_select(workspace_id)
-                if next_url:
-                    out = next_url
+            next_url = self._select_workspace_from_page(page_url=out)
+            if next_url:
+                out = next_url
         return out
 
-    @staticmethod
-    def _extract_workspace_id_from_html(html_text: str) -> str:
-        """从 workspace 页面 HTML 文本中提取 workspace_id（兜底）。"""
-        if not html_text:
-            return ""
-        try:
-            # 先把转义引号还原，便于正则匹配
-            text = html_text.replace('\\"', '"')
-            patterns = [
-                r'workspaces".{0,1600}?"id","([0-9a-fA-F-]{36})"',
-                r'"workspace_id"\s*:\s*"([0-9a-fA-F-]{36})"',
-                r'"workspaceId"\s*:\s*"([0-9a-fA-F-]{36})"',
-            ]
-            for p in patterns:
-                m = re.search(p, text, flags=re.DOTALL | re.IGNORECASE)
-                if m:
-                    return (m.group(1) or "").strip()
-        except Exception:
-            return ""
+    def _extract_workspace_id_from_html(self, html_text: str) -> str:
+        """从 workspace 页面 HTML 文本中提取第一个 workspace_id（兜底）。"""
+        for ws in self._extract_workspaces_from_html(html_text):
+            wid = self._workspace_id_of(ws)
+            if wid:
+                return wid
         return ""
 
     # ── Step 10: 跟踪重定向链 ──
@@ -3247,15 +3497,12 @@ class AuthFlow:
 
             # workspace 页面常见为 200，需要主动调 workspace/select 获取下一跳
             if "/workspace" in current_url and resp.status_code == 200:
-                workspace_id = self._extract_workspace_id() or self._extract_workspace_id_from_html(resp.text or "")
-                if workspace_id:
-                    logger.info("workspace 页面提取到 workspace_id=%s，尝试继续授权", workspace_id)
-                    next_url = self._workspace_select(workspace_id)
-                    if next_url:
-                        if next_url.startswith("/"):
-                            next_url = urljoin("https://auth.openai.com", next_url)
-                        current_url = next_url
-                        continue
+                next_url = self._select_workspace_from_page(resp.text or "", current_url)
+                if next_url:
+                    if next_url.startswith("/"):
+                        next_url = urljoin("https://auth.openai.com", next_url)
+                    current_url = next_url
+                    continue
 
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("Location", "")
@@ -4026,6 +4273,7 @@ class AuthFlow:
         elif not self.result.is_valid():
             raise RuntimeError("注册完成但未获取有效凭证")
 
+        self._log_chatgpt_accounts_after_login()
         logger.info("注册流程完成!")
         return self.result
 
@@ -4088,6 +4336,7 @@ class AuthFlow:
         elif not self.result.is_valid():
             raise RuntimeError("协议登录完成，但未拿到有效 session/access token")
 
+        self._log_chatgpt_accounts_after_login()
         logger.info("纯协议登录流程完成")
         return self.result
 
